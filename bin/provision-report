@@ -73,6 +73,7 @@ jget() {
 
 last_run=""
 total=0; ok=0; changed=0; missing=0; unreadable=0
+targets_seen=()
 
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -93,7 +94,8 @@ while IFS= read -r line; do
     target="$(jget "$line" target)"
 
     if [[ "$TARGETS" -eq 1 ]]; then
-        printf '%s\n' "$target"
+        # Deduplicated at the end — a target changed by five runs is one line.
+        targets_seen+=("$target")
         continue
     fi
 
@@ -143,6 +145,10 @@ while IFS= read -r line; do
     [[ -n "$detail" ]] && printf '            %s%s%s\n' "$C_DIM" "$detail" "$C_RST"
     [[ -n "$backup" ]] && printf '            %sbackup: %s%s\n' "$C_DIM" "$backup" "$C_RST"
 done < "$JOURNAL_FILE"
+
+if [[ "$TARGETS" -eq 1 ]]; then
+    [[ ${#targets_seen[@]} -gt 0 ]] && printf '%s\n' "${targets_seen[@]}" | awk '!seen[$0]++'
+fi
 
 if [[ "$RAW" -eq 0 && "$TARGETS" -eq 0 ]]; then
     printf '\n%d record(s)' "$total"

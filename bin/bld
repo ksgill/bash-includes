@@ -28,6 +28,8 @@ set -euo pipefail
 #   # embed: packages/*.list   inline data files, extracted to a temp dir at
 #   #                          run time and exposed as $BLD_EMBED_DIR.
 #   #                          Binary files are base64-encoded automatically.
+#   #                          A glob matching nothing fails the build; use
+#   # embed?: assets/*.png     for data that is genuinely optional.
 #   ... development bootstrap ...
 #   # <<< bash-includes <<<
 #
@@ -167,14 +169,28 @@ build_one() {
     done < <(grep -oP '^#\s*include:\s*\K\S+' <<< "$block" || true)
 
     local embeds=()
+    local f matched glob
+    # Globs are relative to the repo root. A required embed matching nothing is
+    # fatal: the built script would reference data that is not there and fail
+    # at runtime, far from the cause. Genuinely optional data (rover's icon)
+    # uses "# embed?:" instead.
     while read -r glob; do
         [[ -n "$glob" ]] || continue
-        local f
-        # Globs are relative to the repo root.
+        matched=0
         for f in "${repo}"/${glob}; do
-            [[ -f "$f" ]] && embeds+=("$f")
+            [[ -f "$f" ]] && { embeds+=("$f"); matched=1; }
         done
+        [[ "$matched" -eq 1 ]] \
+            || die "${src}: '# embed: ${glob}' matched nothing under ${repo} — build what it needs first, or mark it '# embed?:' if optional"
     done < <(grep -oP '^#\s*embed:\s*\K\S+' <<< "$block" || true)
+    while read -r glob; do
+        [[ -n "$glob" ]] || continue
+        matched=0
+        for f in "${repo}"/${glob}; do
+            [[ -f "$f" ]] && { embeds+=("$f"); matched=1; }
+        done
+        [[ "$matched" -eq 1 ]] || info "optional embed '${glob}' matched nothing — skipped"
+    done < <(grep -oP '^#\s*embed\?:\s*\K\S+' <<< "$block" || true)
 
     local version
     version="$(git -C "$repo" describe --tags --always --dirty 2>/dev/null || echo unknown)"

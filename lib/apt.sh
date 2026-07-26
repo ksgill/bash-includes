@@ -50,9 +50,9 @@ apt_add_repo() {
 
     # ── Already configured correctly? ────────────────────────────────────────
     if [[ -f "$sources" ]]; then
-        if grep -q "^URIs: ${uris}\$"        "$sources" 2>/dev/null && \
-           grep -q "^Suites: ${suites}\$"    "$sources" 2>/dev/null && \
-           grep -q "^Signed-By: ${keyring}\$" "$sources" 2>/dev/null && \
+        if grep -qxF "URIs: ${uris}"        "$sources" 2>/dev/null && \
+           grep -qxF "Suites: ${suites}"    "$sources" 2>/dev/null && \
+           grep -qxF "Signed-By: ${keyring}" "$sources" 2>/dev/null && \
            [[ -f "$keyring" ]]; then
             log_info "APT repo '${name}' already configured for '${suites}'"
             return 0

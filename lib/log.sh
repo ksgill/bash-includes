@@ -42,6 +42,10 @@ log_open_transcript() {
         log_warn "Could not open transcript $path — continuing without one"
         return 0
     fi
+    # The file must be owned by the invoking user: sudo touch creates it
+    # root-owned, and every subsequent append happens unprivileged — against a
+    # root-owned 0644 file each one fails, so the transcript stays empty.
+    sudo chown -- "$(id -un)" "$path" 2>/dev/null || true
     sudo chmod 0644 -- "$path" 2>/dev/null || true
 
     _LOG_FILE="$path"
@@ -68,7 +72,10 @@ _log() {
 
     # Transcript always gets the uncoloured form.
     if [[ -n "$_LOG_FILE" ]]; then
-        printf '[%s] [%s] %s\n' "$ts" "$label" "$*" >> "$_LOG_FILE" 2>/dev/null || true
+        # Brace group so the redirect failure itself is silenced: redirections
+        # process left to right, and a failed >> reports to stderr before a
+        # trailing 2>/dev/null takes effect.
+        { printf '[%s] [%s] %s\n' "$ts" "$label" "$*" >> "$_LOG_FILE"; } 2>/dev/null || true
     fi
 }
 

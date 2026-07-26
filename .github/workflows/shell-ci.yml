@@ -1,13 +1,14 @@
 # Reusable shell CI. Called by each consumer repository so there is one
 # definition rather than five drifting copies.
 #
-# This repository is public, so callers need no secret: the automatic
-# GITHUB_TOKEN can check it out, and a public repository's reusable workflows
-# are callable without the Actions -> Access setting a private one requires.
+# This repository is public, so callers need no secret: build.sh clones it
+# anonymously over https, and a public repository's reusable workflows are
+# callable without the Actions -> Access setting a private one requires.
 #
-# That is the practical reason this library is public — it is mechanism only,
-# with nothing describing how any machine is configured, so publishing it costs
-# nothing and removes a per-repo credential from every consumer.
+# The build job deliberately uses the same path a user gets: ./build.sh with
+# no BASH_INCLUDES_DIR, cloning the tag pinned in LIB_VERSION. An earlier
+# version injected the library via env var — which meant the pin was never
+# exercised, and a stale LIB_VERSION shipped unnoticed.
 
 name: shell-ci
 
@@ -15,11 +16,11 @@ on:
   workflow_call:
     inputs:
       build:
-        description: "Run ./build.sh and check dist/ is current"
+        description: "Run ./build.sh (pinned clone path) and check dist/ is current"
         type: boolean
         default: true
-      lib-ref:
-        description: "bash-includes ref to build against (default: LIB_VERSION)"
+      smoke:
+        description: "Command(s) run from a checkout with BASH_INCLUDES_DIR set — exercises the dev bootstrap the build path strips"
         type: string
         default: ""
 
@@ -54,15 +55,8 @@ jobs:
         with:
           fetch-depth: 0    # build.sh stamps git describe
 
-      - name: Check out bash-includes
-        uses: actions/checkout@v4
-        with:
-          repository: ksgill/bash-includes
-          ref: ${{ inputs.lib-ref }}
-          path: .lib
-
-      - name: Build
-        run: BASH_INCLUDES_DIR="$PWD/.lib/lib" ./build.sh
+      - name: Build via the pinned clone path
+        run: ./build.sh     # no BASH_INCLUDES_DIR: clones the LIB_VERSION tag
 
       - name: dist/ is current
         run: |
@@ -71,6 +65,11 @@ jobs:
           # except that line.
           fail=0
           for f in dist/*; do
+            if ! git cat-file -e "HEAD:$f" 2>/dev/null; then
+              echo "::error file=$f::$f is not committed — run ./build.sh and commit"
+              fail=1
+              continue
+            fi
             if ! diff <(grep -v '^SCRIPT_VERSION=\|^# Version:' "$f") \
                       <(git show "HEAD:$f" | grep -v '^SCRIPT_VERSION=\|^# Version:') >/dev/null; then
               echo "::error file=$f::$f is stale — run ./build.sh and commit"
@@ -78,6 +77,24 @@ jobs:
             fi
           done
           exit $fail
+
+  smoke:
+    if: inputs.smoke != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out bash-includes at the pinned tag
+        run: |
+          git clone --quiet --depth 1 --branch "$(cat LIB_VERSION)" \
+            https://github.com/ksgill/bash-includes.git .lib
+
+      # Checkout mode runs the development bootstrap that the build strips —
+      # the one code path a dist-only test can never reach.
+      - name: Run from the checkout
+        run: |
+          export BASH_INCLUDES_DIR="$PWD/.lib/lib"
+          ${{ inputs.smoke }}
 
   bats:
     runs-on: ubuntu-latest
