@@ -1,0 +1,96 @@
+# Reusable shell CI. Called by each consumer repository so there is one
+# definition rather than five drifting copies.
+#
+# Callers must enable Settings -> Actions -> General -> Access ->
+# "Accessible from repositories owned by ksgill" on this repository.
+#
+# While bash-includes is private, building a consumer requires cloning it, and
+# the automatic GITHUB_TOKEN is scoped to its own repository only. Callers pass
+# a read-only fine-grained PAT as the `lib-token` secret. If this repository is
+# ever made public that secret becomes unnecessary.
+
+name: shell-ci
+
+on:
+  workflow_call:
+    inputs:
+      build:
+        description: "Run ./build.sh and check dist/ is current"
+        type: boolean
+        default: true
+      lib-ref:
+        description: "bash-includes ref to build against (default: LIB_VERSION)"
+        type: string
+        default: ""
+    secrets:
+      lib-token:
+        description: "Read-only PAT for cloning bash-includes"
+        required: false
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # dist/ is generated — its findings belong to the sources it was built
+      # from, so checking it would just double-report every issue.
+      - name: shellcheck sources
+        run: |
+          mapfile -t files < <(
+            git ls-files '*.sh' 'bin/*' \
+              | grep -v '^dist/' \
+              | while read -r f; do [[ -f "$f" ]] && head -1 "$f" | grep -q '^#!.*\(bash\|sh\)' && echo "$f"; done
+          )
+          # Library files are sourced fragments, so SC1091 (can't follow
+          # source) and SC2034 (unused var, set for the caller) are expected.
+          printf '%s\n' "${files[@]}"
+          shellcheck -x -e SC1091,SC2034 -S warning "${files[@]}"
+
+  build:
+    if: inputs.build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # build.sh stamps git describe
+
+      - name: Check out bash-includes
+        uses: actions/checkout@v4
+        with:
+          repository: ksgill/bash-includes
+          ref: ${{ inputs.lib-ref }}
+          token: ${{ secrets.lib-token || github.token }}
+          path: .lib
+
+      - name: Build
+        run: BASH_INCLUDES_DIR="$PWD/.lib/lib" ./build.sh
+
+      - name: dist/ is current
+        run: |
+          # The version stamp names the source revision built from, so a
+          # committed dist/ always trails by one commit. Compare everything
+          # except that line.
+          fail=0
+          for f in dist/*; do
+            if ! diff <(grep -v '^SCRIPT_VERSION=\|^# Version:' "$f") \
+                      <(git show "HEAD:$f" | grep -v '^SCRIPT_VERSION=\|^# Version:') >/dev/null; then
+              echo "::error file=$f::$f is stale — run ./build.sh and commit"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: echo "have=$([[ -d tests ]] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+      - if: steps.check.outputs.have == 'yes'
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - if: steps.check.outputs.have == 'yes'
+        run: bats tests/
