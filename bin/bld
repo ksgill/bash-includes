@@ -26,7 +26,8 @@ set -euo pipefail
 #   # >>> bash-includes >>>
 #   # include: log.sh          pull in a library file, with its own includes
 #   # embed: packages/*.list   inline data files, extracted to a temp dir at
-#   #                          run time and exposed as $BLD_EMBED_DIR
+#   #                          run time and exposed as $BLD_EMBED_DIR.
+#   #                          Binary files are base64-encoded automatically.
 #   ... development bootstrap ...
 #   # <<< bash-includes <<<
 #
@@ -220,12 +221,22 @@ build_one() {
             local f rel
             for f in "${embeds[@]}"; do
                 rel="${f#"${repo}"/}"
-                grep -q -F "$EMBED_EOF" "$f" \
-                    && die "${f}: contains the embed delimiter ${EMBED_EOF}"
                 printf 'mkdir -p "$BLD_EMBED_DIR/%s"\n' "$(dirname -- "$rel")"
-                printf "cat > \"\$BLD_EMBED_DIR/%s\" <<'%s'\n" "$rel" "$EMBED_EOF"
-                cat "$f"
-                printf '%s\n' "$EMBED_EOF"
+
+                # A heredoc cannot carry NUL bytes or invalid UTF-8, so binary
+                # files (icons, keyrings) are base64-encoded. grep -I is the
+                # portable "is this text?" test.
+                if LC_ALL=C grep -qI . "$f" 2>/dev/null || [[ ! -s "$f" ]]; then
+                    grep -q -F "$EMBED_EOF" "$f" \
+                        && die "${f}: contains the embed delimiter ${EMBED_EOF}"
+                    printf "cat > \"\$BLD_EMBED_DIR/%s\" <<'%s'\n" "$rel" "$EMBED_EOF"
+                    cat "$f"
+                    printf '%s\n' "$EMBED_EOF"
+                else
+                    printf "base64 -d > \"\$BLD_EMBED_DIR/%s\" <<'%s'\n" "$rel" "$EMBED_EOF"
+                    base64 "$f"
+                    printf '%s\n' "$EMBED_EOF"
+                fi
             done
             printf '\n'
         fi
