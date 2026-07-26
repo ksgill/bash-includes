@@ -20,6 +20,8 @@
 #
 # Depends on: log.sh, journal.sh
 
+# include: log.sh
+# include: journal.sh
 [[ -n "${_LIB_BACKUP_SOURCED:-}" ]] && return 0
 _LIB_BACKUP_SOURCED=1
 

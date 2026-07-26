@@ -10,6 +10,8 @@
 #
 # Depends on: log.sh, os.sh; journal.sh and backup.sh if loaded.
 
+# include: log.sh
+# include: os.sh
 [[ -n "${_LIB_APT_SOURCED:-}" ]] && return 0
 _LIB_APT_SOURCED=1
 
@@ -139,11 +141,15 @@ apt_remove_repo() {
 
 # ── apt_install <package>... ──────────────────────────────────────────────────
 # Non-interactive install with a single journal entry for the set.
+#
+# `sudo env VAR=… cmd` rather than `sudo VAR=… cmd`: the latter depends on the
+# sudoers env_reset/SETENV policy and is rejected outright under some
+# configurations. Going through env(1) is unambiguous everywhere.
 apt_install() {
     [[ $# -gt 0 ]] || return 0
 
     log_info "Installing: $*"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" \
         || die "Failed to install: $*"
 
     if declare -f journal_record >/dev/null 2>&1; then
@@ -169,7 +175,7 @@ apt_install_list() {
     [[ ${#pkgs[@]} -gt 0 ]] || { log_warn "No packages listed in ${list}"; return 0; }
 
     log_info "Installing package list $(basename -- "$list") (${#pkgs[@]} packages)"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" \
         || die "Failed to install package list: ${list}"
 
     if declare -f journal_record >/dev/null 2>&1; then

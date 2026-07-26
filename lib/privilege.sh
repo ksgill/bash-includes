@@ -12,6 +12,7 @@
 #
 # Depends on: log.sh
 
+# include: log.sh
 [[ -n "${_LIB_PRIVILEGE_SOURCED:-}" ]] && return 0
 _LIB_PRIVILEGE_SOURCED=1
 

@@ -23,6 +23,7 @@ lib/backup.sh         the .orig / .bak backup convention
 lib/os.sh             OS, arch, kernel, init and session detection
 lib/apt.sh            APT repository and package helpers
 bin/provision-report  read and verify the change journal
+bin/bld               resolve # include: directives into a self-contained script
 ```
 
 ## Conventions
@@ -67,10 +68,40 @@ backup_file /etc/some/config.conf "enabling widget support"
 journal_record modify /etc/some/config.conf "enabled widget support"
 ```
 
-Consumers resolve `# include:` directives at build time and ship a
-self-contained script, so deployed scripts have no runtime dependency on this
-repository. Includes are resolved transitively — declaring `backup.sh` pulls in
-`journal.sh` and `log.sh` automatically.
+## Building
+
+Consumers wrap their includes and a development bootstrap in a marker block:
+
+```bash
+# >>> bash-includes >>>
+# include: backup.sh
+# embed: packages/*.list
+_bootstrap_lib() { ... }      # lets the script run from a checkout
+_bootstrap_lib
+# <<< bash-includes <<<
+```
+
+`bin/bld` replaces that whole block with the library inlined, producing a file
+with no runtime dependency on this repository — deployment is one copy rather
+than a bootstrap sequence.
+
+```bash
+bld -L lib -L /path/to/bash-includes/lib -o dist myscript.sh
+```
+
+Includes resolve **transitively**: declaring `backup.sh` pulls in `journal.sh`
+and `log.sh`, emitted in dependency order. Double-source guards are stripped
+during inlining — `return` outside a function is fatal in a concatenated
+script, and de-duplication is the builder's job.
+
+`# embed:` inlines data files as heredocs, extracted to a temp directory at run
+time and exposed as `$BLD_EMBED_DIR`, so a script that reads manifests is still
+a single file.
+
+Each build stamps `git describe --tags --always --dirty` into `SCRIPT_VERSION`,
+which the change journal records — so an entry says not just what changed but
+exactly which revision changed it, and `-dirty` flags a build from an
+uncommitted tree.
 
 ## Checking a system
 

@@ -20,6 +20,7 @@
 #
 # Depends on: log.sh
 
+# include: log.sh
 [[ -n "${_LIB_JOURNAL_SOURCED:-}" ]] && return 0
 _LIB_JOURNAL_SOURCED=1
 

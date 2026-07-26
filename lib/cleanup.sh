@@ -13,6 +13,7 @@
 #
 # Depends on: log.sh
 
+# include: log.sh
 [[ -n "${_LIB_CLEANUP_SOURCED:-}" ]] && return 0
 _LIB_CLEANUP_SOURCED=1
 

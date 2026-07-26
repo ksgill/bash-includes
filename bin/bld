@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# bld — resolve # include: directives into a self-contained script.
+#
+# Source scripts declare what they need and carry a small runtime bootstrap for
+# development. bld replaces that block with the library code inlined, producing
+# a single file with no runtime dependency on this repository — which is what
+# makes deployment to a fresh machine one copy instead of a bootstrap sequence.
+#
+# It also solves the generated-artefact problem: an SSH payload or a service
+# hook can be built from the same library source as the script that writes it,
+# instead of being hand-copied and drifting.
+#
+# Usage:
+#   bld [-L <libdir>]... [-o <outdir>] [-r <repo>] <source.sh>...
+#
+#   -L  library search path, repeatable. Searched in order, so a repo-local
+#       lib/ can shadow the shared library. Defaults to $BASH_INCLUDES_DIR.
+#   -o  output directory (default: dist)
+#   -r  repository root for the version stamp and embed globs (default: the
+#       source file's directory, walked up to the git root)
+#
+# Directives, recognised only inside the marker block:
+#
+#   # >>> bash-includes >>>
+#   # include: log.sh          pull in a library file, with its own includes
+#   # embed: packages/*.list   inline data files, extracted to a temp dir at
+#   #                          run time and exposed as $BLD_EMBED_DIR
+#   ... development bootstrap ...
+#   # <<< bash-includes <<<
+#
+# Everything between the markers is replaced. Write the bootstrap so the script
+# runs from a checkout without building; the built artefact never contains it.
+
+MARK_OPEN='# >>> bash-includes >>>'
+MARK_CLOSE='# <<< bash-includes <<<'
+EMBED_EOF='__BLD_EMBED_EOF__'
+
+LIBDIRS=()
+OUTDIR="dist"
+REPO=""
+
+die() { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[0;36m[bld]\033[0m %s\n' "$*"; }
+
+usage() { sed -n '3,32p' "$0" | sed 's/^# \?//'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -L) LIBDIRS+=("${2:?-L needs a directory}"); shift 2 ;;
+        -o) OUTDIR="${2:?-o needs a directory}"; shift 2 ;;
+        -r) REPO="${2:?-r needs a directory}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) usage >&2; die "Unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
+[[ $# -gt 0 ]] || { usage >&2; die "No source files given"; }
+
+if [[ ${#LIBDIRS[@]} -eq 0 ]]; then
+    [[ -n "${BASH_INCLUDES_DIR:-}" ]] \
+        || die "No -L given and BASH_INCLUDES_DIR is unset — nowhere to resolve includes from"
+    LIBDIRS=("$BASH_INCLUDES_DIR")
+fi
+
+for d in "${LIBDIRS[@]}"; do
+    [[ -d "$d" ]] || die "Library directory not found: $d"
+done
+
+# ── include resolution ────────────────────────────────────────────────────────
+
+find_lib() {
+    local name="$1" d
+    for d in "${LIBDIRS[@]}"; do
+        if [[ -r "${d}/${name}" ]]; then
+            printf '%s' "${d}/${name}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Directives are read only from a file's header — the run of comment lines
+# before the first non-comment. That keeps a `# include:` mentioned in prose
+# further down from being treated as a dependency.
+read_includes() {
+    awk '
+        /^#!/            { next }
+        /^[[:space:]]*$/ { next }
+        /^#/             { if (match($0, /^# include:[[:space:]]*/))
+                               print substr($0, RSTART + RLENGTH)
+                           next }
+        { exit }
+    ' "$1"
+}
+
+RESOLVED=()      # emit order, dependencies first
+declare -A STATE # name -> visiting | done
+
+resolve() {
+    local name="$1" parent="${2:-<source>}" path dep
+
+    case "${STATE[$name]:-}" in
+        done)     return 0 ;;
+        visiting) die "Include cycle detected: ${parent} -> ${name}" ;;
+    esac
+
+    path="$(find_lib "$name")" \
+        || die "Cannot resolve '# include: ${name}' (required by ${parent}) in: ${LIBDIRS[*]}"
+
+    STATE[$name]="visiting"
+    while read -r dep; do
+        [[ -n "$dep" ]] && resolve "$dep" "$name"
+    done < <(read_includes "$path")
+    STATE[$name]="done"
+
+    RESOLVED+=("${name}=${path}")
+}
+
+# Strip what must not survive concatenation:
+#   - the shebang (only the entry point keeps one)
+#   - include directives (already resolved)
+#   - double-source guards — `return` outside a function is a fatal error in a
+#     concatenated script, and de-duplication is bld's job anyway
+strip_lib() {
+    sed -e '1{/^#!/d}' \
+        -e '/^# include:[[:space:]]/d' \
+        -e '/^\[\[ -n "\${_[A-Z_]*_SOURCED:-}" \]\] && return 0$/d' \
+        -e '/^_[A-Z_]*_SOURCED=1$/d' \
+        "$1"
+}
+
+# ── build one source file ─────────────────────────────────────────────────────
+
+build_one() {
+    local src="$1"
+    [[ -r "$src" ]] || die "Cannot read source: $src"
+
+    local repo="$REPO"
+    if [[ -z "$repo" ]]; then
+        repo="$(cd -- "$(dirname -- "$src")" && git rev-parse --show-toplevel 2>/dev/null || dirname -- "$src")"
+    fi
+
+    local open_line close_line
+    open_line="$(grep -n -F -x "$MARK_OPEN"  "$src" | head -1 | cut -d: -f1 || true)"
+    close_line="$(grep -n -F -x "$MARK_CLOSE" "$src" | head -1 | cut -d: -f1 || true)"
+
+    [[ -n "$open_line" && -n "$close_line" ]] \
+        || die "${src}: no marker block. Wrap the includes and dev bootstrap in:
+    ${MARK_OPEN}
+    ...
+    ${MARK_CLOSE}"
+    [[ "$close_line" -gt "$open_line" ]] || die "${src}: markers are out of order"
+
+    # Reset per-source resolution state.
+    RESOLVED=()
+    STATE=()
+
+    local block name glob
+    block="$(sed -n "$((open_line + 1)),$((close_line - 1))p" "$src")"
+
+    while read -r name; do
+        [[ -n "$name" ]] && resolve "$name" "$(basename -- "$src")"
+    done < <(grep -oP '^#\s*include:\s*\K\S+' <<< "$block" || true)
+
+    local embeds=()
+    while read -r glob; do
+        [[ -n "$glob" ]] || continue
+        local f
+        # Globs are relative to the repo root.
+        for f in "${repo}"/${glob}; do
+            [[ -f "$f" ]] && embeds+=("$f")
+        done
+    done < <(grep -oP '^#\s*embed:\s*\K\S+' <<< "$block" || true)
+
+    local version
+    version="$(git -C "$repo" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+
+    local out="${OUTDIR}/$(basename -- "$src")"
+    mkdir -p "$OUTDIR"
+
+    {
+        # The entry point's own shebang, if it has one.
+        sed -n '1{/^#!/p}' "$src"
+
+        printf '#\n'
+        printf '# GENERATED by bld — do not edit.\n'
+        printf '# Source:  %s\n' "$(basename -- "$src")"
+        printf '# Version: %s\n' "$version"
+        printf '# Library: %s\n' "$(printf '%s ' "${RESOLVED[@]%%=*}")"
+        printf '#\n'
+        printf '# Edit the source and rebuild:  ./build.sh\n\n'
+
+        # Set before the source body so its own
+        # SCRIPT_VERSION="${SCRIPT_VERSION:-dev}" keeps this value.
+        printf 'SCRIPT_VERSION="%s"\n\n' "$version"
+
+        local entry libname libpath
+        for entry in "${RESOLVED[@]}"; do
+            libname="${entry%%=*}"
+            libpath="${entry#*=}"
+            printf '# ─── %s ─────────────────────────────────────────────────\n' "$libname"
+            strip_lib "$libpath"
+            printf '\n'
+        done
+
+        if [[ ${#embeds[@]} -gt 0 ]]; then
+            printf '# ─── embedded data ──────────────────────────────────────\n'
+            printf 'BLD_EMBED_DIR="$(mktemp -d)"\n'
+            # cleanup.sh owns the EXIT trap; use it when present so we do not
+            # clobber the handler stack with a second trap.
+            printf 'if declare -f cleanup_push >/dev/null 2>&1; then\n'
+            printf '    cleanup_push "rm -rf \\"$BLD_EMBED_DIR\\""\n'
+            printf 'else\n'
+            printf '    trap '"'"'rm -rf "$BLD_EMBED_DIR"'"'"' EXIT\n'
+            printf 'fi\n'
+
+            local f rel
+            for f in "${embeds[@]}"; do
+                rel="${f#"${repo}"/}"
+                grep -q -F "$EMBED_EOF" "$f" \
+                    && die "${f}: contains the embed delimiter ${EMBED_EOF}"
+                printf 'mkdir -p "$BLD_EMBED_DIR/%s"\n' "$(dirname -- "$rel")"
+                printf "cat > \"\$BLD_EMBED_DIR/%s\" <<'%s'\n" "$rel" "$EMBED_EOF"
+                cat "$f"
+                printf '%s\n' "$EMBED_EOF"
+            done
+            printf '\n'
+        fi
+
+        printf '# ─── %s ─────────────────────────────────────────────────\n' "$(basename -- "$src")"
+        # Source body: everything except the shebang and the marker block.
+        sed -e '1{/^#!/d}' -e "${open_line},${close_line}d" "$src"
+    } > "$out"
+
+    chmod +x "$out"
+
+    bash -n "$out" || die "${out} failed syntax check — the build is wrong, not the source"
+
+    info "$(basename -- "$src") -> ${out}  [${version}]  $(wc -l < "$out") lines, ${#RESOLVED[@]} modules, ${#embeds[@]} embedded"
+}
+
+for src in "$@"; do
+    build_one "$src"
+done
