@@ -305,3 +305,79 @@ STUB
     ip_in_range 10.0.5.7 10.0.0.0 16
     ! ip_in_range 10.1.5.7 10.0.0.0 16
 }
+
+# ── oui.sh ────────────────────────────────────────────────────────────────────
+
+@test "oui_normalize accepts every common separator style" {
+    . "${LIB}/oui.sh"
+    [ "$(oui_normalize 00:11:22:33:44:55)" = "001122" ]
+    [ "$(oui_normalize 00-11-22)"          = "001122" ]
+    [ "$(oui_normalize 0011.2233.4455)"    = "001122" ]
+    [ "$(oui_normalize '00 11 22')"        = "001122" ]
+    [ "$(oui_normalize aabbccddeeff)"      = "AABBCC" ]
+}
+
+@test "oui_normalize rejects short and non-hex input" {
+    . "${LIB}/oui.sh"
+    run oui_normalize "00:11"
+    [ "$status" -ne 0 ]
+    run oui_normalize "zz:11:22"
+    [ "$status" -ne 0 ]
+}
+
+@test "oui_format produces the IEEE record prefix" {
+    . "${LIB}/oui.sh"
+    [ "$(oui_format 001122)" = "00-11-22" ]
+    [ "$(oui_format AABBCC)" = "AA-BB-CC" ]
+}
+
+@test "oui_lookup finds a vendor and reports an unassigned prefix" {
+    . "${LIB}/oui.sh"
+    export OUI_FILE="${TMP}/oui.txt"
+    printf '%s\n' \
+        '00-11-22   (hex)		CIMSYS Inc' \
+        '' \
+        '001122     (base 16)		CIMSYS Inc' \
+        'AA-BB-CC   (hex)		Example Corp' \
+        'AABBCC     (base 16)		Example Corp' > "$OUI_FILE"
+
+    run oui_lookup 00:11:22:33:44:55
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CIMSYS"* ]]
+
+    run oui_lookup ff:ff:ff:00:00:00
+    [ "$status" -eq 1 ]
+}
+
+@test "oui_vendor extracts just the organisation name" {
+    . "${LIB}/oui.sh"
+    export OUI_FILE="${TMP}/oui.txt"
+    printf '%s\n' '00-11-22   (hex)		CIMSYS Inc' > "$OUI_FILE"
+    run oui_vendor 001122334455
+    [ "$output" = "CIMSYS Inc" ]
+}
+
+@test "oui_random_for_vendor matches the vendor field, not the address" {
+    . "${LIB}/oui.sh"
+    export OUI_FILE="${TMP}/oui.txt"
+    # The second record is a different company on a street named "Acme" —
+    # a whole-line match would wrongly return its prefix.
+    printf '%s\n' \
+        'AA1111     (base 16)		Acme Networks' \
+        'BB2222     (base 16)		Globex Ltd' \
+        '				12 Acme Street' > "$OUI_FILE"
+
+    for _ in 1 2 3 4 5; do
+        run oui_random_for_vendor acme
+        [ "$status" -eq 0 ]
+        [ "$output" = "AA1111" ]
+    done
+}
+
+@test "oui_random_for_vendor fails cleanly on an unknown vendor" {
+    . "${LIB}/oui.sh"
+    export OUI_FILE="${TMP}/oui.txt"
+    printf '%s\n' 'AA1111     (base 16)		Acme Networks' > "$OUI_FILE"
+    run oui_random_for_vendor nosuchvendor
+    [ "$status" -ne 0 ]
+}
