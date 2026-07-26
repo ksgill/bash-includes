@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# provision-report — read and verify the system change journal.
+#
+# Answers "what has been done to this machine, and has anything changed since?"
+# Reads /var/lib/provision/changes.jsonl, written by scripts using lib/journal.sh.
+#
+# Deliberately dependency-free: the journal is flat JSON with string values only,
+# so it is parsed here with bash regex rather than requiring jq or python.
+
+set -euo pipefail
+
+JOURNAL_FILE="${JOURNAL_FILE:-/var/lib/provision/changes.jsonl}"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'
+    C_CYN=$'\033[0;36m'; C_DIM=$'\033[2m';    C_RST=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_CYN=''; C_DIM=''; C_RST=''
+fi
+
+usage() {
+    cat <<'HELP'
+Usage: provision-report [OPTIONS]
+
+Show the record of persistent changes made to this system.
+
+Options:
+  --verify            Re-hash every journalled file and report drift
+  --run <id>          Show only records from one run
+  --script <name>     Show only records written by one script
+  --targets           List distinct changed paths, nothing else
+  --raw               Emit matching JSONL unchanged
+  -h, --help          This message
+
+Verify status:
+  OK        file still matches the hash recorded when it was changed
+  CHANGED   file has been modified since — by something other than that script
+  MISSING   file no longer exists
+  NOREAD    file could not be read, so drift could not be checked
+  -         no hash was recorded (package installs, deletions)
+HELP
+}
+
+VERIFY=0; RAW=0; TARGETS=0; FILTER_RUN=""; FILTER_SCRIPT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verify)  VERIFY=1; shift ;;
+        --raw)     RAW=1; shift ;;
+        --targets) TARGETS=1; shift ;;
+        --run)     FILTER_RUN="${2:-}"; shift 2 ;;
+        --script)  FILTER_SCRIPT="${2:-}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'Unknown option: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ ! -r "$JOURNAL_FILE" ]]; then
+    printf 'No journal at %s — nothing has been recorded on this system.\n' "$JOURNAL_FILE" >&2
+    exit 1
+fi
+
+# Extract one string field from a flat JSON object, honouring backslash escapes.
+jget() {
+    local line="$1" key="$2"
+    if [[ "$line" =~ \"$key\":\"(([^\"\\]|\\.)*)\" ]]; then
+        local v="${BASH_REMATCH[1]}"
+        v="${v//\\n/$'\n'}"; v="${v//\\t/$'\t'}"
+        v="${v//\\\"/\"}";   v="${v//\\\\/\\}"
+        printf '%s' "$v"
+    fi
+}
+
+last_run=""
+total=0; ok=0; changed=0; missing=0; unreadable=0
+
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    run="$(jget "$line" run)"
+    script="$(jget "$line" script)"
+
+    [[ -n "$FILTER_RUN"    && "$run"    != "$FILTER_RUN"    ]] && continue
+    [[ -n "$FILTER_SCRIPT" && "$script" != "$FILTER_SCRIPT" ]] && continue
+
+    total=$((total + 1))
+
+    if [[ "$RAW" -eq 1 ]]; then
+        printf '%s\n' "$line"
+        continue
+    fi
+
+    target="$(jget "$line" target)"
+
+    if [[ "$TARGETS" -eq 1 ]]; then
+        printf '%s\n' "$target"
+        continue
+    fi
+
+    ts="$(jget "$line" ts)"
+    action="$(jget "$line" action)"
+    detail="$(jget "$line" detail)"
+    version="$(jget "$line" version)"
+    backup="$(jget "$line" backup)"
+    sha="$(jget "$line" sha256_after)"
+
+    # Run header whenever the run id changes.
+    if [[ "$run" != "$last_run" ]]; then
+        [[ -n "$last_run" ]] && printf '\n'
+        printf '%s● run %s  %s  %s%s\n' \
+            "$C_CYN" "$run" "$script" "${version:-unknown}" "$C_RST"
+        last_run="$run"
+    fi
+
+    status=""
+    if [[ "$VERIFY" -eq 1 ]]; then
+        if [[ -z "$sha" ]]; then
+            status="${C_DIM}   -    ${C_RST}"
+        elif [[ ! -e "$target" ]]; then
+            status="${C_RED}MISSING${C_RST} "; missing=$((missing + 1))
+        else
+            # Most journalled files are world-readable, so try unprivileged
+            # first and only escalate when we have to. An unreadable file must
+            # report UNREADABLE, never CHANGED — reporting drift we could not
+            # actually measure would send you chasing a change that never
+            # happened.
+            now="$(sha256sum -- "$target" 2>/dev/null | cut -d' ' -f1 || true)"
+            if [[ -z "$now" ]]; then
+                now="$(sudo -n sha256sum -- "$target" 2>/dev/null | cut -d' ' -f1 || true)"
+            fi
+
+            if [[ -z "$now" ]]; then
+                status="${C_YEL}NOREAD ${C_RST} "; unreadable=$((unreadable + 1))
+            elif [[ "$now" == "$sha" ]]; then
+                status="${C_GRN}  OK   ${C_RST} "; ok=$((ok + 1))
+            else
+                status="${C_YEL}CHANGED${C_RST} "; changed=$((changed + 1))
+            fi
+        fi
+    fi
+
+    printf '  %s%s  %-8s %s\n' "$status" "${ts:0:19}" "$action" "$target"
+    [[ -n "$detail" ]] && printf '            %s%s%s\n' "$C_DIM" "$detail" "$C_RST"
+    [[ -n "$backup" ]] && printf '            %sbackup: %s%s\n' "$C_DIM" "$backup" "$C_RST"
+done < "$JOURNAL_FILE"
+
+if [[ "$RAW" -eq 0 && "$TARGETS" -eq 0 ]]; then
+    printf '\n%d record(s)' "$total"
+    [[ "$VERIFY" -eq 1 ]] && printf '  —  %d ok, %d changed, %d missing, %d unreadable' \
+        "$ok" "$changed" "$missing" "$unreadable"
+    printf '\n'
+fi
