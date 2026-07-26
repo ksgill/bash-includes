@@ -250,6 +250,49 @@ build_one() {
 
     bash -n "$out" || die "${out} failed syntax check — the build is wrong, not the source"
 
+    # Two modules defining the same function name is silent breakage: the later
+    # definition wins at runtime and the caller gets whichever semantics landed
+    # last. Sourcing hides this behind load order; inlining makes it permanent.
+    #
+    # Heredoc bodies are skipped. Scripts that generate other scripts embed
+    # function definitions as *text* — counting those would report collisions
+    # that do not exist. Openers are matched anywhere on the line, because
+    # `cat <<EOF | sudo tee x` is as common as one at end of line.
+    local dupes
+    dupes="$(awk '
+        heredoc != "" {
+            line = $0
+            sub(/^[\t ]+/, "", line)
+            if (line == heredoc) heredoc = ""
+            next
+        }
+        {
+            if (match($0, /<<-?[ \t]*'"'"'?"?[A-Za-z_][A-Za-z0-9_]*"?'"'"'?/)) {
+                tok      = substr($0, RSTART, RLENGTH)
+                before   = substr($0, RSTART - 1, 1)
+                after_lt = substr($0, RSTART + 2, 1)
+                # Skip <<< herestrings and the tail of a <<< match.
+                if (after_lt != "<" && before != "<") {
+                    d = tok
+                    gsub(/^<<-?[ \t]*|["'"'"']/, "", d)
+                    heredoc = d
+                    next
+                }
+            }
+        }
+        /^(function[ \t]+)?[a-zA-Z0-9_]+[ \t]*\(\)/ {
+            n = $0
+            sub(/^function[ \t]+/, "", n)
+            sub(/[ \t]*\(\).*/, "", n)
+            print n
+        }
+    ' "$out" | sort | uniq -d || true)"
+    if [[ -n "$dupes" ]]; then
+        printf 'Duplicate function definitions in %s:\n' "$out" >&2
+        printf '    %s\n' $dupes >&2
+        die "Rename one of them — the last definition silently wins at runtime"
+    fi
+
     info "$(basename -- "$src") -> ${out}  [${version}]  $(wc -l < "$out") lines, ${#RESOLVED[@]} modules, ${#embeds[@]} embedded"
 }
 

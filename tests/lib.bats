@@ -256,3 +256,43 @@ LIST
     "
     [ "$status" -eq 42 ]
 }
+
+# ── net.sh ────────────────────────────────────────────────────────────────────
+
+@test "mask_to_cidr converts common masks" {
+    . "${LIB}/net.sh"
+    [ "$(mask_to_cidr 255.255.255.0)" = "24" ]
+    [ "$(mask_to_cidr 255.255.0.0)"   = "16" ]
+    [ "$(mask_to_cidr 255.255.255.252)" = "30" ]
+    [ "$(mask_to_cidr 255.255.255.255)" = "32" ]
+    [ "$(mask_to_cidr 0.0.0.0)"       = "0" ]
+}
+
+@test "derive_network_addr masks an address to its network" {
+    . "${LIB}/net.sh"
+    [ "$(derive_network_addr 10.1.2.3 16)"     = "10.1.0.0" ]
+    [ "$(derive_network_addr 192.168.7.99 24)" = "192.168.7.0" ]
+    [ "$(derive_network_addr 172.16.30.5 12)"  = "172.16.0.0" ]
+    [ "$(derive_network_addr 10.9.9.9 32)"     = "10.9.9.9" ]
+    [ "$(derive_network_addr 10.9.9.9 0)"      = "0.0.0.0" ]
+}
+
+@test "ranges_overlap detects identical, containing and partial overlaps" {
+    . "${LIB}/net.sh"
+    ranges_overlap 10.0.0.0 16 10.0.0.0  16   # identical
+    ranges_overlap 10.0.0.0 16 10.0.5.0  24   # containment
+    ranges_overlap 10.0.0.0 15 10.1.0.0  16   # partial
+}
+
+@test "ranges_overlap rejects disjoint ranges" {
+    . "${LIB}/net.sh"
+    ! ranges_overlap 10.0.0.0  16 10.1.0.0    16
+    ! ranges_overlap 192.168.1.0 24 192.168.2.0 24
+    ! ranges_overlap 10.8.0.0  24 172.16.0.0  16
+}
+
+@test "ip_in_range decides membership" {
+    . "${LIB}/net.sh"
+    ip_in_range 10.0.5.7 10.0.0.0 16
+    ! ip_in_range 10.1.5.7 10.0.0.0 16
+}
