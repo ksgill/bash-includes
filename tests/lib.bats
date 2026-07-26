@@ -171,9 +171,18 @@ gamma   # trailing comment
 
 #delta
 LIST
-    # Capture what would be installed rather than installing it.
-    apt-get() { printf '%s\n' "$@"; }
-    export -f apt-get
+
+    # The stub must be a real executable on PATH, not a shell function:
+    # apt_install_list goes through `sudo env … apt-get`, and env execs
+    # binaries directly, so an exported bash function is invisible to it.
+    mkdir -p "${TMP}/bin"
+    cat > "${TMP}/bin/apt-get" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@"
+STUB
+    chmod +x "${TMP}/bin/apt-get"
+    PATH="${TMP}/bin:${PATH}"
+
     run apt_install_list "${TMP}/pkgs.list"
     [ "$status" -eq 0 ]
     [[ "$output" == *"3 packages"* ]]

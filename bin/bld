@@ -179,7 +179,8 @@ build_one() {
     local version
     version="$(git -C "$repo" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 
-    local out="${OUTDIR}/$(basename -- "$src")"
+    local out
+    out="${OUTDIR}/$(basename -- "$src")"
     mkdir -p "$OUTDIR"
 
     {
