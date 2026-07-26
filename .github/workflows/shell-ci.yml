@@ -1,13 +1,13 @@
 # Reusable shell CI. Called by each consumer repository so there is one
 # definition rather than five drifting copies.
 #
-# Callers must enable Settings -> Actions -> General -> Access ->
-# "Accessible from repositories owned by ksgill" on this repository.
+# This repository is public, so callers need no secret: the automatic
+# GITHUB_TOKEN can check it out, and a public repository's reusable workflows
+# are callable without the Actions -> Access setting a private one requires.
 #
-# While bash-includes is private, building a consumer requires cloning it, and
-# the automatic GITHUB_TOKEN is scoped to its own repository only. Callers pass
-# a read-only fine-grained PAT as the `lib-token` secret. If this repository is
-# ever made public that secret becomes unnecessary.
+# That is the practical reason this library is public — it is mechanism only,
+# with nothing describing how any machine is configured, so publishing it costs
+# nothing and removes a per-repo credential from every consumer.
 
 name: shell-ci
 
@@ -22,10 +22,6 @@ on:
         description: "bash-includes ref to build against (default: LIB_VERSION)"
         type: string
         default: ""
-    secrets:
-      lib-token:
-        description: "Read-only PAT for cloning bash-includes"
-        required: false
 
 jobs:
   shellcheck:
@@ -63,7 +59,6 @@ jobs:
         with:
           repository: ksgill/bash-includes
           ref: ${{ inputs.lib-ref }}
-          token: ${{ secrets.lib-token || github.token }}
           path: .lib
 
       - name: Build
