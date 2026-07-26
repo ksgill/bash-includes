@@ -37,11 +37,18 @@ jobs:
       # from, so checking it would just double-report every issue.
       - name: shellcheck sources
         run: |
+          # Select by shebang, not by extension. An extension glob silently
+          # skips whole repositories of extensionless commands — and reports
+          # success while checking nothing.
           mapfile -t files < <(
-            git ls-files '*.sh' 'bin/*' \
+            git ls-files \
               | grep -v '^dist/' \
-              | while read -r f; do [[ -f "$f" ]] && head -1 "$f" | grep -q '^#!.*\(bash\|sh\)' && echo "$f"; done
+              | while read -r f; do [[ -f "$f" ]] && head -1 "$f" 2>/dev/null | grep -q '^#!.*\(bash\|sh\)' && echo "$f"; done
           )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No shell scripts found — the selector is probably wrong"
+            exit 1
+          fi
           # Library files are sourced fragments, so SC1091 (can't follow
           # source) and SC2034 (unused var, set for the caller) are expected.
           printf '%s\n' "${files[@]}"
