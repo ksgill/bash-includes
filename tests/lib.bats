@@ -389,6 +389,94 @@ STUB
     [ "$status" -ne 0 ]
 }
 
+# ── host.sh: set_hostname ─────────────────────────────────────────────────────
+# hostnamectl is stubbed as a real executable on PATH rather than a shell
+# function: set_hostname reaches it through `sudo`, and while this suite's sudo
+# stub is a function that would see one, a binary stub is what actually models
+# the call and cannot be silently bypassed.
+
+_stub_hostnamectl() {
+    # $1 = the static hostname to report, $2 = exit status for set-hostname
+    mkdir -p "${TMP}/bin"
+    cat > "${TMP}/bin/hostnamectl" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+    --static)      printf '%s\n' '${1}' ;;
+    set-hostname)  printf '%s\n' "\$2" > "${TMP}/set-to"; exit ${2:-0} ;;
+esac
+STUB
+    chmod +x "${TMP}/bin/hostnamectl"
+    PATH="${TMP}/bin:${PATH}"
+}
+
+@test "set_hostname skips an empty name instead of failing" {
+    # sys-bld's checklist calls `set_hostname ""` for a step you fill in per
+    # machine, so an unfilled step must skip rather than abort the whole run.
+    . "${LIB}/host.sh"
+    _stub_hostnamectl oldname
+    journal_init "t" "v1"
+
+    run set_hostname ""
+    [ "$status" -eq 0 ]
+    [[ "$output" == *skipping* ]]
+    [ ! -f "${TMP}/set-to" ]
+}
+
+@test "set_hostname is a no-op when the name already matches" {
+    . "${LIB}/host.sh"
+    _stub_hostnamectl alreadyset
+    journal_init "t" "v1"
+
+    run set_hostname alreadyset
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already alreadyset"* ]]
+    [ ! -f "${TMP}/set-to" ]
+}
+
+@test "set_hostname sets a new name and journals the change" {
+    . "${LIB}/host.sh"
+    _stub_hostnamectl oldname
+    journal_init "t" "v1"
+
+    run set_hostname newname
+    [ "$status" -eq 0 ]
+    [ "$(cat "${TMP}/set-to")" = "newname" ]
+
+    grep -q '"target":"/etc/hostname"' "$JOURNAL_FILE"
+    grep -q 'oldname -> newname' "$JOURNAL_FILE"
+}
+
+@test "set_hostname records no journal entry when nothing changed" {
+    # Re-running a provisioning checklist must not append a fresh entry each
+    # time — the journal answers "what was done to this box", not "what ran".
+    . "${LIB}/host.sh"
+    _stub_hostnamectl samename
+    journal_init "t" "v1"
+
+    set_hostname samename >/dev/null
+    [ ! -s "$JOURNAL_FILE" ] || ! grep -q '/etc/hostname' "$JOURNAL_FILE"
+}
+
+@test "set_hostname dies when hostnamectl fails" {
+    . "${LIB}/host.sh"
+    _stub_hostnamectl oldname 1
+    journal_init "t" "v1"
+
+    run set_hostname newname
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Failed to set hostname"* ]]
+}
+
+@test "set_hostname does not journal a failed change" {
+    . "${LIB}/host.sh"
+    _stub_hostnamectl oldname 1
+    journal_init "t" "v1"
+
+    run set_hostname newname
+    [ "$status" -ne 0 ]
+    [ ! -s "$JOURNAL_FILE" ] || ! grep -q '/etc/hostname' "$JOURNAL_FILE"
+}
+
 # ── bld: version stamping ─────────────────────────────────────────────────────
 # Regression cover for the per-file stamp bug. bld is invoked with several
 # sources at once, and writing dist/<first>.sh dirties the working tree — so a
