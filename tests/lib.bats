@@ -409,6 +409,89 @@ STUB
     PATH="${TMP}/bin:${PATH}"
 }
 
+@test "hostname_is_valid accepts ordinary names" {
+    . "${LIB}/host.sh"
+    for n in host1 my-host web01.example.com a A9 my_host; do
+        run hostname_is_valid "$n"
+        [ "$status" -eq 0 ]
+    done
+}
+
+@test "hostname_is_valid allows underscores" {
+    # DNS discourages them, systemd accepts them, and they appear in real
+    # deployments — rejecting one would break a working setup.
+    . "${LIB}/host.sh"
+    run hostname_is_valid my_host
+    [ "$status" -eq 0 ]
+}
+
+@test "hostname_is_valid rejects the unambiguously invalid" {
+    . "${LIB}/host.sh"
+    for n in "" "-lead" "trail-" ".lead" "trail." "a..b" "has space" \
+             "bad!char" "tab	here" "new
+line"; do
+        run hostname_is_valid "$n"
+        [ "$status" -ne 0 ]
+    done
+}
+
+@test "hostname_is_valid enforces HOST_NAME_MAX" {
+    # 64 on Linux, per `getconf HOST_NAME_MAX`.
+    . "${LIB}/host.sh"
+    run hostname_is_valid "$(printf '%064d' 0)"
+    [ "$status" -eq 0 ]
+    run hostname_is_valid "$(printf '%065d' 0)"
+    [ "$status" -ne 0 ]
+}
+
+@test "set_hostname rejects an invalid name before touching the system" {
+    . "${LIB}/host.sh"
+    _stub_hostnamectl oldname
+    journal_init "t" "v1"
+
+    run set_hostname "bad name"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid hostname"* ]]
+    # Nothing was attempted and nothing was recorded.
+    [ ! -f "${TMP}/set-to" ]
+    [ ! -s "$JOURNAL_FILE" ] || ! grep -q '/etc/hostname' "$JOURNAL_FILE"
+}
+
+@test "set_hostname still treats empty as a skip, not an invalid name" {
+    # The empty check must stay AHEAD of validation: sys-bld's checklist
+    # depends on an unfilled step skipping rather than dying.
+    . "${LIB}/host.sh"
+    _stub_hostnamectl oldname
+    journal_init "t" "v1"
+
+    run set_hostname ""
+    [ "$status" -eq 0 ]
+    [[ "$output" == *skipping* ]]
+    [[ "$output" != *"Invalid hostname"* ]]
+}
+
+@test "set_hostname surfaces hostnamectl's own error text" {
+    # "Failed to set hostname" alone says nothing about why; the usual causes
+    # (polkit, read-only /etc, hostnamed not running) are distinguishable only
+    # from hostnamectl's output.
+    mkdir -p "${TMP}/bin"
+    cat > "${TMP}/bin/hostnamectl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+    --static)     printf 'oldname\n' ;;
+    set-hostname) echo "Could not contact systemd-hostnamed" >&2; exit 1 ;;
+esac
+STUB
+    chmod +x "${TMP}/bin/hostnamectl"
+    PATH="${TMP}/bin:${PATH}"
+
+    . "${LIB}/host.sh"
+    journal_init "t" "v1"
+    run set_hostname newname
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"systemd-hostnamed"* ]]
+}
+
 @test "set_hostname skips an empty name instead of failing" {
     # sys-bld's checklist calls `set_hostname ""` for a step you fill in per
     # machine, so an unfilled step must skip rather than abort the whole run.

@@ -15,6 +15,37 @@
 [[ -n "${_LIB_HOST_SOURCED:-}" ]] && return 0
 _LIB_HOST_SOURCED=1
 
+# ── hostname_is_valid <name> ──────────────────────────────────────────────────
+# True if <name> is a syntactically usable static hostname.
+#
+# This is deliberately a SUBSET of what hostnamectl rejects: it catches the
+# cases that are invalid under both DNS and systemd, and stays quiet about
+# anything arguable. hostnamectl remains the authority — the point here is to
+# fail early with a message that names the problem, not to reimplement its
+# check and risk rejecting a name it would have accepted.
+#
+# Rejected: empty, longer than HOST_NAME_MAX (64 on Linux, per `getconf
+# HOST_NAME_MAX`), any character outside [A-Za-z0-9._-], a leading or trailing
+# '-' or '.', and an empty label from consecutive dots. Underscores are
+# ALLOWED: DNS discourages them but systemd accepts them and they appear in
+# real deployments, so rejecting one would break a working setup.
+#
+# Exposed separately from set_hostname so a caller can check a name before
+# escalating — systool validates here rather than after priming sudo, so a
+# typo fails immediately instead of costing a password prompt.
+hostname_is_valid() {
+    local name="${1:-}"
+
+    [[ -n "$name" ]]                  || return 1
+    (( ${#name} <= 64 ))              || return 1
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$name" != [-.]* ]]            || return 1
+    [[ "$name" != *[-.] ]]            || return 1
+    [[ "$name" != *..* ]]             || return 1
+
+    return 0
+}
+
 # ── set_hostname <name> ───────────────────────────────────────────────────────
 # Set the static hostname, idempotently, and journal the change.
 #
@@ -34,6 +65,11 @@ set_hostname() {
         return 0
     fi
 
+    # Validate before comparing or setting. A bad name reaching hostnamectl
+    # produces a message about D-Bus rather than about the name.
+    hostname_is_valid "$new" \
+        || die "Invalid hostname '${new}' — use letters, digits, '.', '-' or '_', at most 64 characters, not starting or ending with '-' or '.'"
+
     local current
     current="$(hostnamectl --static 2>/dev/null || hostname)"
     if [[ "$current" == "$new" ]]; then
@@ -41,7 +77,13 @@ set_hostname() {
         return 0
     fi
 
-    sudo hostnamectl set-hostname "$new" || die "Failed to set hostname"
+    # Capture hostnamectl's own diagnostic: "Failed to set hostname" alone
+    # says nothing about why, and the usual causes (polkit, read-only /etc,
+    # systemd-hostnamed not running) are all distinguishable from its output.
+    local err
+    if ! err="$(sudo hostnamectl set-hostname "$new" 2>&1)"; then
+        die "Failed to set hostname to '${new}'${err:+ — ${err}}"
+    fi
     journal_record modify /etc/hostname "hostname ${current} -> ${new}"
     log_success "Hostname set to ${new}"
 
