@@ -85,6 +85,34 @@ jobs:
           done
           exit $fail
 
+      - name: dist/ provenance
+        run: |
+          # bld stamps `git describe --tags --always --dirty` of the tree it
+          # built from. A -dirty stamp means the artifact came out of a working
+          # tree with uncommitted edits, so it cannot be traced back to any
+          # commit — you cannot tell which source produced what shipped.
+          #
+          # The freshness check above deliberately ignores the stamp lines, so
+          # nothing else catches this. Checked against the COMMITTED dist/, not
+          # the one just built: CI always builds from a clean checkout, so a
+          # freshly built artifact is never dirty and testing it proves nothing.
+          #
+          # The fix is the two-step flow §12 already implies: commit the source,
+          # then re-run ./build.sh and commit dist/ on its own. That is why a
+          # committed dist/ trails its source by one commit.
+          shopt -s nullglob
+          fail=0
+          for f in dist/*; do
+            git cat-file -e "HEAD:$f" 2>/dev/null || continue
+            stamp=$(git show "HEAD:$f" | sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' | head -1)
+            case "$stamp" in
+              "")       echo "::warning file=$f::no version stamp found in $f" ;;
+              *-dirty)  echo "::error file=$f::$f was built from a dirty tree (stamp: $stamp). Commit the source, re-run ./build.sh, then commit dist/ separately."
+                        fail=1 ;;
+            esac
+          done
+          exit $fail
+
   smoke:
     if: inputs.smoke != ''
     runs-on: ubuntu-latest
