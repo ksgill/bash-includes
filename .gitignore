@@ -1,0 +1,7 @@
+# Secrets must never be committed. This library is mechanism-only and holds no
+# policy or credentials by design — the guard is here so that stays true.
+*.secret
+*.secrets
+secrets/
+*.key
+*.pem
