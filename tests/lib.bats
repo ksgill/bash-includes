@@ -22,8 +22,15 @@ setup() {
 
     # shellcheck source=/dev/null
     . "${LIB}/log.sh"
-    # shellcheck source=/dev/null
-    . "${LIB}/cleanup.sh"
+    # cleanup.sh is deliberately NOT sourced here. It installs `trap _cleanup_run
+    # EXIT` (plus INT/TERM handlers), and in the bats test process that replaces
+    # the EXIT trap bats uses to emit the TAP result line — so a FAILING test
+    # printed nothing at all, leaving only "Executed N instead of expected M".
+    # The suite exited non-zero, but never said which test broke.
+    #
+    # Nothing here needs it: the two cleanup tests source it inside their own
+    # `bash -c` subshells, and the only library callers (privilege.sh, oui.sh)
+    # guard with `declare -f cleanup_push`.
     # shellcheck source=/dev/null
     . "${LIB}/journal.sh"
     # shellcheck source=/dev/null
@@ -380,4 +387,88 @@ STUB
     printf '%s\n' 'AA1111     (base 16)		Acme Networks' > "$OUI_FILE"
     run oui_random_for_vendor nosuchvendor
     [ "$status" -ne 0 ]
+}
+
+# ── bld: version stamping ─────────────────────────────────────────────────────
+# Regression cover for the per-file stamp bug. bld is invoked with several
+# sources at once, and writing dist/<first>.sh dirties the working tree — so a
+# `git describe --dirty` evaluated per file stamped artifact one clean and
+# every later one -dirty, from a pristine checkout. The stamp is the only
+# record of which source produced a shipped artifact, and shell-ci now fails a
+# committed dist/ carrying a -dirty stamp, so this must not regress.
+#
+# Nothing here cd's the test process into $TMP: teardown removes that tree, and
+# a bats run whose cwd has been deleted aborts without reporting the failing
+# test at all. bld is invoked in a subshell instead.
+
+_bld_fixture_repo() {
+    local repo="${TMP}/bldrepo" n
+    mkdir -p "${repo}/dist"
+    git -C "${repo}" init -q .
+    git -C "${repo}" config user.email 'test@example.invalid'
+    git -C "${repo}" config user.name 'test'
+
+    for n in one two; do
+        cat > "${repo}/${n}.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# >>> bash-includes >>>
+# include: log.sh
+_bootstrap_lib() { . "${LIB}/log.sh"; }
+_bootstrap_lib
+# <<< bash-includes <<<
+SCRIPT_VERSION="\${SCRIPT_VERSION:-dev}"
+EOF
+        # A committed placeholder, so that bld writing the real artifact makes
+        # the tree dirty. Without it the bug is invisible: nothing tracked
+        # changes and every stamp comes out clean either way.
+        printf 'placeholder\n' > "${repo}/dist/${n}.sh"
+    done
+
+    git -C "${repo}" add -A
+    git -C "${repo}" commit -qm 'fixture'
+}
+
+_bld_run() {
+    ( cd "${TMP}/bldrepo" && "${BIN}/bld" -L "${LIB}" -o dist "$@" )
+}
+
+_bld_stamp() {
+    sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' "${TMP}/bldrepo/dist/$1" | head -1
+}
+
+@test "bld stamps every artifact in a run with the same version" {
+    _bld_fixture_repo
+    run _bld_run one.sh two.sh
+    [ "$status" -eq 0 ]
+
+    first="$(_bld_stamp one.sh)"
+    second="$(_bld_stamp two.sh)"
+
+    [ -n "$first" ]
+    [ "$first" = "$second" ]
+}
+
+@test "bld does not stamp -dirty for artifacts written after the first" {
+    _bld_fixture_repo
+    run _bld_run one.sh two.sh
+    [ "$status" -eq 0 ]
+
+    # The tree was clean when the run began, so neither artifact may claim
+    # otherwise — including the second, written after dist/one.sh dirtied it.
+    [[ "$(_bld_stamp one.sh)" != *-dirty ]]
+    [[ "$(_bld_stamp two.sh)" != *-dirty ]]
+}
+
+@test "bld strips the development bootstrap from the artifact" {
+    _bld_fixture_repo
+    run _bld_run one.sh
+    [ "$status" -eq 0 ]
+
+    # The marker block and its bootstrap must not survive into dist/: that is
+    # what makes the artifact standalone.
+    ! grep -q '_bootstrap_lib' "${TMP}/bldrepo/dist/one.sh"
+    ! grep -q '>>> bash-includes >>>' "${TMP}/bldrepo/dist/one.sh"
+    # ...and the library it asked for must actually be inlined.
+    grep -q 'log_open_transcript()' "${TMP}/bldrepo/dist/one.sh"
 }
