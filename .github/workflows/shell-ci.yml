@@ -30,8 +30,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # Pinned, not apt. ubuntu-latest's package is 0.9.0 while development
+      # here happens against 0.11.0, and the two disagree: 0.9.0 reports
+      # SC2015 for `[[ c ]] && cmd || true` and 0.11.0 does not. That drift
+      # made usb-nas-bld's lint pass locally and fail in CI, which no amount
+      # of local checking could have found. Pinning means a finding here is
+      # reproducible on the workstation and vice versa.
+      #
+      # The checksum is verified before the binary runs: this is a release
+      # tarball fetched over the network into a job that then executes it.
+      - name: Install pinned shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o sc.tar.xz "$url"
+          echo "${SHELLCHECK_SHA256}  sc.tar.xz" | sha256sum -c -
+          tar -xJf sc.tar.xz
+          sudo install -m 0755 "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          rm -rf sc.tar.xz "shellcheck-${SHELLCHECK_VERSION}"
+          shellcheck --version
 
       # dist/ is generated — its findings belong to the sources it was built
       # from, so checking it would just double-report every issue.
