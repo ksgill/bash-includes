@@ -37,6 +37,17 @@ setup() {
     . "${LIB}/backup.sh"
     # shellcheck source=/dev/null
     . "${LIB}/apt.sh"
+    # shellcheck source=/dev/null
+    . "${LIB}/git.sh"
+}
+
+# git.sh writes into ~/.ssh and ~/.gitconfig, so every test below redirects HOME
+# into the temp tree first. Without it the suite would rewrite the running
+# user's real git identity and ssh config.
+_git_home() {
+    export HOME="${TMP}/home"
+    mkdir -p "${HOME}"
+    journal_init "test" "v1"
 }
 
 teardown() {
@@ -642,4 +653,185 @@ _bld_stamp() {
     ! grep -q '>>> bash-includes >>>' "${TMP}/bldrepo/dist/one.sh"
     # ...and the library it asked for must actually be inlined.
     grep -q 'log_open_transcript()' "${TMP}/bldrepo/dist/one.sh"
+}
+
+
+# ── git.sh ────────────────────────────────────────────────────────────────────
+
+@test "git_identity_config sets name, email and the default branch" {
+    _git_home
+    git_identity_config "Test User" "test@example.com"
+    [ "$(git config --global user.name)"  = "Test User" ]
+    [ "$(git config --global user.email)" = "test@example.com" ]
+    [ "$(git config --global init.defaultBranch)" = "main" ]
+}
+
+@test "git_identity_config creates an empty global ignore and points at it" {
+    _git_home
+    git_identity_config "Test User" "test@example.com"
+    ignore="$(git config --global core.excludesfile)"
+    [ -f "$ignore" ]
+    # Created empty of patterns: a comment line only.
+    [ "$(grep -cv '^#' "$ignore")" -eq 0 ]
+}
+
+@test "git_identity_config refuses a missing name or email" {
+    _git_home
+    run git_identity_config "" "test@example.com"
+    [ "$status" -ne 0 ]
+    run git_identity_config "Test User" ""
+    [ "$status" -ne 0 ]
+}
+
+@test "git_identity_config does not clobber an ignore file that already exists" {
+    _git_home
+    mkdir -p "${HOME}/.config/git"
+    printf 'node_modules/\n' > "${HOME}/.config/git/ignore"
+    git_identity_config "Test User" "test@example.com"
+    grep -qx 'node_modules/' "${HOME}/.config/git/ignore"
+}
+
+@test "git_ensure_key generates an ed25519 key when none is there" {
+    _git_home
+    git_ensure_key "${HOME}/.ssh/git@github.com" "test@example.com"
+    [ -f "${HOME}/.ssh/git@github.com" ]
+    ssh-keygen -lf "${HOME}/.ssh/git@github.com" | grep -q ED25519
+    [ "$(stat -c %a "${HOME}/.ssh/git@github.com")" = "600" ]
+    [ "$(stat -c %a "${HOME}/.ssh/git@github.com.pub")" = "644" ]
+    [ "$(stat -c %a "${HOME}/.ssh")" = "700" ]
+}
+
+@test "git_ensure_key leaves an existing key alone but fixes its mode" {
+    _git_home
+    mkdir -p "${HOME}/.ssh"
+    printf 'NOT A REAL KEY\n' > "${HOME}/.ssh/git@github.com"
+    chmod 0644 "${HOME}/.ssh/git@github.com"
+    git_ensure_key "${HOME}/.ssh/git@github.com"
+    [ "$(cat "${HOME}/.ssh/git@github.com")" = "NOT A REAL KEY" ]
+    [ "$(stat -c %a "${HOME}/.ssh/git@github.com")" = "600" ]
+}
+
+@test "git_ensure_key needs a path" {
+    _git_home
+    run git_ensure_key ""
+    [ "$status" -ne 0 ]
+}
+
+@test "_git_strip_github_host_block removes a Host github block" {
+    _git_home
+    printf 'Host github\n    User git\n\nHost other\n    User bob\n' > "${TMP}/cfg"
+    run _git_strip_github_host_block "${TMP}/cfg"
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'Host other'
+    ! echo "$output" | grep -q 'Host github'
+    echo "$output" | grep -q 'User bob'
+}
+
+@test "_git_strip_github_host_block removes a Host github.com block too" {
+    _git_home
+    printf 'Host github.com\n    User git\n' > "${TMP}/cfg"
+    run _git_strip_github_host_block "${TMP}/cfg"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "_git_strip_github_host_block keeps a host that merely resembles github" {
+    _git_home
+    printf 'Host githubbery\n    User git\n' > "${TMP}/cfg"
+    run _git_strip_github_host_block "${TMP}/cfg"
+    [ "$status" -ne 0 ]
+}
+
+@test "_git_strip_github_host_block reports nothing to do" {
+    _git_home
+    printf 'Host other\n    User bob\n' > "${TMP}/cfg"
+    run _git_strip_github_host_block "${TMP}/cfg"
+    [ "$status" -ne 0 ]
+}
+
+@test "git_github_ssh_stanza writes a 0600 stanza and includes it first" {
+    _git_home
+    git_github_ssh_stanza "${HOME}/.ssh/git@github.com"
+    [ "$(stat -c %a "${HOME}/.ssh/config.d/10-github.conf")" = "600" ]
+    grep -qx 'Host github' "${HOME}/.ssh/config.d/10-github.conf"
+    grep -q 'AddKeysToAgent no' "${HOME}/.ssh/config.d/10-github.conf"
+    grep -q 'HostKeyAlgorithms ssh-ed25519' "${HOME}/.ssh/config.d/10-github.conf"
+    [ "$(head -1 "${HOME}/.ssh/config")" = 'Include ~/.ssh/config.d/*.conf' ]
+}
+
+@test "git_github_ssh_stanza is idempotent" {
+    _git_home
+    git_github_ssh_stanza
+    before="$(cat "${HOME}/.ssh/config")"
+    git_github_ssh_stanza
+    [ "$(cat "${HOME}/.ssh/config")" = "$before" ]
+    [ "$(grep -c 'Include' "${HOME}/.ssh/config")" -eq 1 ]
+}
+
+@test "git_github_ssh_stanza migrates a stanza appended to ~/.ssh/config" {
+    _git_home
+    mkdir -p "${HOME}/.ssh"
+    printf 'Host other\n    User bob\n\nHost github\n    User git\n    AddKeysToAgent yes\n' \
+        > "${HOME}/.ssh/config"
+    git_github_ssh_stanza
+    # The appended copy is gone from config, the unrelated host survives, and
+    # the real stanza is now the file under config.d.
+    ! grep -q 'Host github' "${HOME}/.ssh/config"
+    grep -q 'Host other' "${HOME}/.ssh/config"
+    grep -qx 'Host github' "${HOME}/.ssh/config.d/10-github.conf"
+}
+
+@test "git_github_ssh_stanza puts the include ahead of an existing Host block" {
+    _git_home
+    mkdir -p "${HOME}/.ssh"
+    printf 'Host *\n    ServerAliveInterval 60\n' > "${HOME}/.ssh/config"
+    git_github_ssh_stanza
+    [ "$(head -1 "${HOME}/.ssh/config")" = 'Include ~/.ssh/config.d/*.conf' ]
+    grep -q 'ServerAliveInterval 60' "${HOME}/.ssh/config"
+}
+
+@test "git_pin_github_host_key writes a key matching its own fingerprint" {
+    _git_home
+    git_pin_github_host_key
+    grep -qxF "$GITHUB_HOST_KEY" "${HOME}/.ssh/known_hosts"
+    got="$(ssh-keygen -lf "${HOME}/.ssh/known_hosts" | awk '{print $2}')"
+    [ "$got" = "$GITHUB_HOST_FPR" ]
+}
+
+@test "git_pin_github_host_key is idempotent" {
+    _git_home
+    git_pin_github_host_key
+    git_pin_github_host_key
+    [ "$(grep -c 'ssh-ed25519' "${HOME}/.ssh/known_hosts")" -eq 1 ]
+}
+
+@test "git_pin_github_host_key replaces an entry acquired by trust-on-first-use" {
+    _git_home
+    mkdir -p "${HOME}/.ssh"
+    ssh-keygen -t ed25519 -f "${TMP}/tofu" -N "" -q
+    printf 'github.com %s\n' "$(cut -d" " -f1,2 < "${TMP}/tofu.pub")" \
+        > "${HOME}/.ssh/known_hosts"
+    git_pin_github_host_key
+    grep -qxF "$GITHUB_HOST_KEY" "${HOME}/.ssh/known_hosts"
+    [ "$(grep -c 'ssh-ed25519' "${HOME}/.ssh/known_hosts")" -eq 1 ]
+}
+
+@test "git_pin_github_host_key refuses a key that contradicts its fingerprint" {
+    _git_home
+    ssh-keygen -t ed25519 -f "${TMP}/wrong" -N "" -q
+    GITHUB_HOST_KEY="github.com $(cut -d" " -f1,2 < "${TMP}/wrong.pub")"
+    run git_pin_github_host_key
+    [ "$status" -ne 0 ]
+    [ ! -f "${HOME}/.ssh/known_hosts" ]
+}
+
+@test "git_pin_github_host_key leaves other hosts in known_hosts alone" {
+    _git_home
+    mkdir -p "${HOME}/.ssh"
+    ssh-keygen -t ed25519 -f "${TMP}/elsewhere" -N "" -q
+    printf 'example.com %s\n' "$(cut -d" " -f1,2 < "${TMP}/elsewhere.pub")" \
+        > "${HOME}/.ssh/known_hosts"
+    git_pin_github_host_key
+    grep -q '^example.com ' "${HOME}/.ssh/known_hosts"
+    grep -qxF "$GITHUB_HOST_KEY" "${HOME}/.ssh/known_hosts"
 }

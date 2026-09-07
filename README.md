@@ -22,6 +22,10 @@ lib/journal.sh        append-only record of persistent system changes
 lib/backup.sh         the .orig / .bak backup convention
 lib/os.sh             OS, arch, kernel, init and session detection
 lib/apt.sh            APT repository and package helpers
+lib/host.sh           hostname validation and setting
+lib/net.sh            address, mask and range arithmetic
+lib/oui.sh            MAC vendor lookup
+lib/git.sh            git identity, GitHub ssh stanza, pinned host key
 bin/provision-report  read and verify the change journal
 bin/bld               resolve # include: directives into a self-contained script
 ```
