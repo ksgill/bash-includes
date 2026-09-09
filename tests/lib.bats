@@ -39,6 +39,8 @@ setup() {
     . "${LIB}/apt.sh"
     # shellcheck source=/dev/null
     . "${LIB}/git.sh"
+    # shellcheck source=/dev/null
+    . "${LIB}/privilege.sh"
 }
 
 # git.sh writes into ~/.ssh and ~/.gitconfig, so every test below redirects HOME
@@ -834,4 +836,103 @@ _bld_stamp() {
     git_pin_github_host_key
     grep -q '^example.com ' "${HOME}/.ssh/known_hosts"
     grep -qxF "$GITHUB_HOST_KEY" "${HOME}/.ssh/known_hosts"
+}
+
+# ── require_unprivileged ──────────────────────────────────────────────────────
+#
+# These replace setup()'s permissive sudo stub with one that records how it was
+# called and simulates a specific sudo configuration. The point of every test
+# is which sudo invocations happen, not what they return: `sudo -v`
+# authenticates even under NOPASSWD:ALL, so calling it when the non-interactive
+# probe already succeeded is what produced a password prompt on every run of a
+# correctly configured machine.
+
+_sudo_calls() { cat "${TMP}/sudo.calls" 2>/dev/null; }
+
+# Passwordless sudo available: `sudo -n true` succeeds.
+_stub_sudo_nopasswd() {
+    # shellcheck disable=SC2317
+    sudo() {
+        printf '%s\n' "$*" >> "${TMP}/sudo.calls"
+        case "$1" in
+            -n) return 0 ;;
+            -v) return 0 ;;
+            *)  return 0 ;;
+        esac
+    }
+    export -f sudo
+}
+
+# Ordinary password sudo: the non-interactive probe fails, -v can still prompt.
+_stub_sudo_password() {
+    # shellcheck disable=SC2317
+    sudo() {
+        printf '%s\n' "$*" >> "${TMP}/sudo.calls"
+        case "$1" in
+            -n) return 1 ;;
+            -v) return 0 ;;
+            *)  return 0 ;;
+        esac
+    }
+    export -f sudo
+}
+
+# No terminal and no NOPASSWD rule: both fail, as sudo does in a pipeline.
+_stub_sudo_unavailable() {
+    # shellcheck disable=SC2317
+    sudo() {
+        printf '%s\n' "$*" >> "${TMP}/sudo.calls"
+        return 1
+    }
+    export -f sudo
+}
+
+@test "require_unprivileged does not run 'sudo -v' when sudo is already passwordless" {
+    _stub_sudo_nopasswd
+    run require_unprivileged
+    [ "$status" -eq 0 ]
+    # The regression this guards: -v authenticates despite NOPASSWD:ALL, so
+    # reaching it here is a password prompt on a machine that needs none.
+    ! _sudo_calls | grep -q -- '-v'
+    _sudo_calls | grep -q -- '-n true'
+}
+
+@test "require_unprivileged primes the timestamp when the probe fails" {
+    _stub_sudo_password
+    run require_unprivileged
+    [ "$status" -eq 0 ]
+    _sudo_calls | grep -q -- '-n true'
+    _sudo_calls | grep -q -- '-v'
+}
+
+@test "require_unprivileged dies when sudo is unavailable altogether" {
+    _stub_sudo_unavailable
+    run require_unprivileged
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sudo access is required"* ]]
+}
+
+@test "require_unprivileged says how to fix a run with no terminal" {
+    _stub_sudo_unavailable
+    run require_unprivileged
+    [[ "$output" == *"NOPASSWD"* ]]
+}
+
+@test "require_unprivileged refuses to run as root" {
+    # EUID is readonly, so the root branch can only be reached by having bash
+    # inherit EUID from the environment. bash 5.3 does; older releases ignore
+    # it and set EUID from the real process. Skipping beats asserting on a
+    # branch that never ran — the failure mode this suite is meant to avoid is
+    # a test that passes locally and means nothing in CI.
+    [ "$(env EUID=0 bash -c 'echo $EUID')" = "0" ] \
+        || skip "this bash does not inherit EUID from the environment"
+
+    _stub_sudo_nopasswd
+    run env EUID=0 bash -c '
+        . "'"${LIB}"'/log.sh"
+        . "'"${LIB}"'/privilege.sh"
+        EUID=0 SUDO_USER=someone require_unprivileged
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not as root"* ]]
 }

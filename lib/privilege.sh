@@ -18,14 +18,20 @@ _LIB_PRIVILEGE_SOURCED=1
 
 _SUDO_KEEPALIVE_PID=""
 
-# ── require_unprivileged ──────────────────────────────────────────────────────
+# ── require_unprivileged [args...] ────────────────────────────────────────────
 # Call at the top of every entry point, before any work.
+#
+# Any arguments are only used to reproduce the command in the "re-run it
+# without sudo" message, so pass "$@" if you want it to name the flags the
+# caller used. Note that this is the *function's* $*, not the script's: it was
+# previously interpolated without any caller passing anything, so the message
+# always ended in a stray double space.
 require_unprivileged() {
     if [[ "${EUID}" -eq 0 ]]; then
         log_error "This script must be run as your normal user, not as root."
         log_error "It calls sudo for the specific commands that need elevation."
         if [[ -n "${SUDO_USER:-}" ]]; then
-            die "Re-run it without sudo:  $0 $*"
+            die "Re-run it without sudo:  ${0}${*:+ $*}"
         fi
         die "Log in as your normal user and re-run it."
     fi
@@ -33,9 +39,36 @@ require_unprivileged() {
     command -v sudo >/dev/null 2>&1 \
         || die "sudo is required but is not installed"
 
+    # Probe non-interactively first, and only prime the timestamp if that
+    # fails.
+    #
+    # This ordering is not an optimisation. `sudo -v` authenticates even when
+    # the invoking user has NOPASSWD:ALL — reproduced on sudo 1.9.17p2 and
+    # sudo-rs 0.2.13, where `sudo -n true` succeeds and `sudo -v` still reports
+    # that a password is required. Calling -v unconditionally therefore
+    # prompted on every run of every script on a machine where passwordless
+    # sudo was configured and working correctly, which reads as the NOPASSWD
+    # rule having failed and sent at least one person hunting through
+    # /etc/sudoers.d for a bug that was here.
+    #
+    # It also broke non-interactive use outright: with no controlling terminal
+    # `sudo -v` fails with "a terminal is required to authenticate" even though
+    # every command the script would go on to run succeeds.
+    #
+    # The caveat, stated plainly: a user with NOPASSWD for some commands but
+    # not all will pass this probe and can still meet a prompt mid-run, which
+    # priming existed to avoid. That configuration is not one these scripts
+    # target — the convention is NOPASSWD:ALL or ordinary password sudo — and
+    # the probe is the same one sudo_keepalive_start already relies on.
+    if sudo -n true 2>/dev/null; then
+        return 0
+    fi
+
     # Prime the sudo timestamp now so the password prompt happens here, at a
     # predictable moment, rather than partway through a long run.
-    sudo -v || die "sudo access is required to continue"
+    sudo -v || die "sudo access is required to continue.
+If this is running without a terminal, sudo cannot prompt: give the invoking
+user a NOPASSWD rule, or run it from a session where it can ask."
 }
 
 # ── sudo_keepalive_start ──────────────────────────────────────────────────────
