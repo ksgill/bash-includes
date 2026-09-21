@@ -128,6 +128,43 @@ print(d['detail'])
     ! grep -q SUPERSECRETVALUE "$JOURNAL_FILE"
 }
 
+@test "_journal_needs_sudo is false for a missing dir under a writable parent" {
+    run _journal_needs_sudo "${TMP}/a/b/c"
+    [ "$status" -eq 1 ]
+}
+
+@test "_journal_needs_sudo is true under a parent the user cannot write" {
+    [[ "$EUID" -eq 0 ]] && skip "root can write anywhere"
+    mkdir "${TMP}/ro"
+    chmod 0555 "${TMP}/ro"
+    run _journal_needs_sudo "${TMP}/ro/journal"
+    chmod 0755 "${TMP}/ro"
+    [ "$status" -eq 0 ]
+}
+
+@test "journal_init creates a per-user journal without sudo" {
+    # shellcheck disable=SC2317
+    sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.log"; "$@"; }
+    JOURNAL_DIR="${TMP}/home/.local/state/tool"
+    JOURNAL_FILE=""
+    journal_init "test" "v1"
+    journal_record install some-package "x"
+    [ ! -e "${TMP}/sudo.log" ]
+    [ -O "${TMP}/home/.local" ]
+    [ -O "${TMP}/home/.local/state" ]
+    [ "$(wc -l < "$JOURNAL_FILE")" -eq 1 ]
+}
+
+@test "journal file and lock follow a JOURNAL_DIR set after sourcing" {
+    JOURNAL_DIR="${TMP}/late"
+    JOURNAL_FILE=""
+    journal_init "test" "v1"
+    [ "$JOURNAL_FILE" = "${TMP}/late/changes.jsonl" ]
+    [ "$JOURNAL_LOCK" = "${TMP}/late/.lock" ]
+    journal_record install some-package "x"
+    [ "$(wc -l < "${TMP}/late/changes.jsonl")" -eq 1 ]
+}
+
 # ── backup_file ───────────────────────────────────────────────────────────────
 
 @test "backup_file does nothing when the target does not exist" {

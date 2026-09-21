@@ -24,14 +24,44 @@
 [[ -n "${_LIB_JOURNAL_SOURCED:-}" ]] && return 0
 _LIB_JOURNAL_SOURCED=1
 
+# Only the directory is defaulted here. The file and lock paths are derived in
+# journal_init, because callers that keep a per-user journal set JOURNAL_DIR
+# after sourcing — deriving them now pinned the lock to /var/lib/provision
+# whatever the caller chose, and every append failed where that did not exist.
 JOURNAL_DIR="${JOURNAL_DIR:-/var/lib/provision}"
-JOURNAL_FILE="${JOURNAL_FILE:-${JOURNAL_DIR}/changes.jsonl}"
-JOURNAL_LOCK="${JOURNAL_DIR}/.lock"
+JOURNAL_FILE="${JOURNAL_FILE:-}"
+JOURNAL_LOCK=""
 
 _JOURNAL_RUN_ID=""
 _JOURNAL_SCRIPT=""
 _JOURNAL_VERSION=""
 _JOURNAL_READY=0
+_JOURNAL_SUDO=0
+
+# ── _journal_needs_sudo <dir> ─────────────────────────────────────────────────
+# Succeeds when <dir> cannot be created or written as the invoking user. Walks
+# up to the nearest existing ancestor and tests that. A journal under $HOME
+# must never be created through sudo: `sudo mkdir -p` makes every missing
+# component root-owned, and a root-owned ~/.local breaks anything else that
+# installs there.
+_journal_needs_sudo() {
+    local d="$1"
+    while [[ ! -e "$d" && "$d" != "/" && -n "$d" ]]; do
+        d="$(dirname -- "$d")"
+    done
+    [[ -d "$d" && -w "$d" && -x "$d" ]] && return 1
+    return 0
+}
+
+# Run a journal write as the invoking user, or through sudo when the journal
+# lives somewhere only root can write.
+_journal_priv() {
+    if [[ "$_JOURNAL_SUDO" -eq 1 ]]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 # ── journal_init [script-name] [version] ──────────────────────────────────────
 # Call once at the start of a script that makes persistent changes.
@@ -49,13 +79,21 @@ journal_init() {
         _JOURNAL_RUN_ID="$(printf '%x%x' "$$" "$(date +%s)" | cut -c1-8)"
     fi
 
-    if ! sudo mkdir -p -- "$JOURNAL_DIR" 2>/dev/null; then
+    JOURNAL_FILE="${JOURNAL_FILE:-${JOURNAL_DIR}/changes.jsonl}"
+    JOURNAL_LOCK="${JOURNAL_DIR}/.lock"
+
+    _JOURNAL_SUDO=0
+    if _journal_needs_sudo "$JOURNAL_DIR"; then
+        _JOURNAL_SUDO=1
+    fi
+
+    if ! _journal_priv mkdir -p -- "$JOURNAL_DIR" 2>/dev/null; then
         log_warn "Cannot create $JOURNAL_DIR — changes will not be journalled"
         return 0
     fi
-    sudo chmod 0755 -- "$JOURNAL_DIR" 2>/dev/null || true
-    sudo touch -- "$JOURNAL_FILE" 2>/dev/null || true
-    sudo chmod 0644 -- "$JOURNAL_FILE" 2>/dev/null || true
+    _journal_priv chmod 0755 -- "$JOURNAL_DIR" 2>/dev/null || true
+    _journal_priv touch -- "$JOURNAL_FILE" 2>/dev/null || true
+    _journal_priv chmod 0644 -- "$JOURNAL_FILE" 2>/dev/null || true
 
     _JOURNAL_READY=1
     log_info "Journal run ${_JOURNAL_RUN_ID} → ${JOURNAL_FILE}"
@@ -120,7 +158,7 @@ journal_record() {
 
     # flock serialises concurrent appends; without it two scripts running at
     # once can interleave partial lines.
-    if ! printf '%s\n' "$line" | sudo flock "$JOURNAL_LOCK" tee -a "$JOURNAL_FILE" >/dev/null 2>&1; then
+    if ! printf '%s\n' "$line" | _journal_priv flock "$JOURNAL_LOCK" tee -a "$JOURNAL_FILE" >/dev/null 2>&1; then
         log_warn "Could not write journal entry for ${target}"
     fi
     return 0

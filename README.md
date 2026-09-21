@@ -52,6 +52,10 @@ state for everything else and is overwritten each run. See `lib/backup.sh`.
 state, not logs, so it survives log rotation. Run transcripts go to
 `/var/log/<script-name>/` separately. The journal records paths, hashes and
 descriptions; never file contents, because callers handle private keys.
+A script that runs per-user can set `JOURNAL_DIR` (before or after sourcing)
+to keep its journal under `~/.local/state` instead; the journal uses `sudo`
+only when the invoking user cannot write where it lives, so nothing under
+`$HOME` ends up root-owned.
 
 ## Use
 
