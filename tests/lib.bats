@@ -695,6 +695,59 @@ _bld_stamp() {
 }
 
 
+# ── bld: embedded files ───────────────────────────────────────────────────────
+# A text file is embedded as a heredoc, and the closing delimiter must start a
+# line. A file whose last line has no newline used to get the delimiter glued
+# onto that line, so the artifact's heredoc never closed: it swallowed the rest
+# of the script, and the extracted file was wrong. Found building openvpn-bld.
+# Every embedded file must come back byte-for-byte, whatever its last byte.
+
+_bld_embed_fixture() {
+    local repo="${TMP}/bldembed"
+    mkdir -p "${repo}/data" "${repo}/dist"
+    git -C "${repo}" init -q .
+    git -C "${repo}" config user.email 'test@example.invalid'
+    git -C "${repo}" config user.name 'test'
+
+    printf 'line one\nline two\n' > "${repo}/data/withnl.txt"
+    printf 'line one\nlast line, no newline' > "${repo}/data/nonl.txt"
+    : > "${repo}/data/empty.txt"
+
+    cat > "${repo}/emb.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# >>> bash-includes >>>
+# embed: data/*.txt
+_bootstrap_lib() { :; }
+_bootstrap_lib
+# <<< bash-includes <<<
+cat "\${BLD_EMBED_DIR}/data/\$1"
+EOF
+    git -C "${repo}" add -A
+    git -C "${repo}" commit -qm 'fixture'
+    ( cd "${repo}" && "${BIN}/bld" -L "${LIB}" -o dist emb.sh )
+}
+
+@test "bld embeds a text file without a trailing newline intact" {
+    _bld_embed_fixture
+    local repo="${TMP}/bldembed"
+    bash -n "${repo}/dist/emb.sh"
+    bash "${repo}/dist/emb.sh" nonl.txt > "${TMP}/out"
+    cmp "${repo}/data/nonl.txt" "${TMP}/out"
+}
+
+@test "bld still embeds ordinary and empty text files byte-for-byte" {
+    _bld_embed_fixture
+    local repo="${TMP}/bldembed" f
+    for f in withnl.txt empty.txt; do
+        bash "${repo}/dist/emb.sh" "$f" > "${TMP}/out"
+        cmp "${repo}/data/${f}" "${TMP}/out"
+    done
+    # An ordinary text file stays a readable heredoc in the artifact.
+    grep -qx 'line two' "${repo}/dist/emb.sh"
+}
+
+
 # ── git.sh ────────────────────────────────────────────────────────────────────
 
 @test "git_identity_config sets name, email and the default branch" {
