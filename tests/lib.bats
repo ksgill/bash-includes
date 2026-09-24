@@ -216,6 +216,164 @@ print(d['detail'])
     grep -q "\"backup\":\"${TMP}/j.conf.bak\"" "$JOURNAL_FILE"
 }
 
+# ── apt_add_repo: signing-key fingerprints ────────────────────────────────────
+# Since v1.5.0 a caller must pin the signing key (--fingerprint) or say
+# explicitly that it will not (--no-fingerprint). Both a downloaded key and an
+# existing keyring must hold only pinned primary keys; a keyring that does not
+# is moved aside, never used. wget and apt-get are stubbed; the two fixture
+# keys are generated once for the file.
+
+setup_file() {
+    export APTKEYS="${BATS_FILE_TMPDIR}/aptkeys"
+    mkdir -p "${APTKEYS}/gnupg"
+    chmod 700 "${APTKEYS}/gnupg"
+    local k
+    for k in a b; do
+        GNUPGHOME="${APTKEYS}/gnupg" gpg --batch --quiet --passphrase '' \
+            --quick-gen-key "Fixture ${k} <${k}@example.invalid>" ed25519 sign never 2>/dev/null
+        GNUPGHOME="${APTKEYS}/gnupg" gpg --batch --armor --export "${k}@example.invalid" > "${APTKEYS}/${k}.asc"
+        GNUPGHOME="${APTKEYS}/gnupg" gpg --batch --export "${k}@example.invalid" > "${APTKEYS}/${k}.gpg"
+        GNUPGHOME="${APTKEYS}/gnupg" gpg --batch --with-colons --fingerprint "${k}@example.invalid" \
+            | awk -F: '/^fpr:/ { print $10; exit }' > "${APTKEYS}/${k}.fpr"
+    done
+    cat "${APTKEYS}/a.asc" "${APTKEYS}/b.asc" > "${APTKEYS}/ab.asc"
+}
+
+# Point the library at the temp tree and stub the network and apt. WGET_SERVES
+# names the fixture the stubbed wget returns; WGET_CALLED records a download.
+_apt_env() {
+    APT_KEYRING_DIR="${TMP}/keyrings"
+    APT_SOURCES_DIR="${TMP}/sources"
+    mkdir -p "$APT_SOURCES_DIR"
+    FPR_A="$(cat "${APTKEYS}/a.fpr")"
+    FPR_B="$(cat "${APTKEYS}/b.fpr")"
+    WGET_CALLED="${TMP}/wget.called"
+    # shellcheck disable=SC2317
+    wget() {
+        local out="" url=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in -qO) out="$2"; shift 2 ;; *) url="$1"; shift ;; esac
+        done
+        : > "$WGET_CALLED"
+        cp "${APTKEYS}/${WGET_SERVES}" "$out"
+    }
+    # shellcheck disable=SC2317
+    apt-get() { return 0; }
+}
+
+_add() {
+    apt_add_repo "$@" fixture 'https://example.invalid/key' 'https://example.invalid/repo' stable
+}
+
+@test "apt_add_repo refuses a call with neither --fingerprint nor --no-fingerprint" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"pass --fingerprint"* ]]
+    [ ! -e "$WGET_CALLED" ]
+}
+
+@test "apt_add_repo refuses --fingerprint together with --no-fingerprint" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A" --no-fingerprint
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"mutually exclusive"* ]]
+}
+
+@test "apt_add_repo rejects a malformed fingerprint" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint 'E158C569'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not a key fingerprint"* ]]
+}
+
+@test "apt_add_repo installs a served key that matches the pin" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ "$(apt_key_fingerprints "${APT_KEYRING_DIR}/fixture.gpg")" = "$FPR_A" ]
+    grep -qxF "Signed-By: ${APT_KEYRING_DIR}/fixture.gpg" "${APT_SOURCES_DIR}/fixture.sources"
+}
+
+@test "apt_add_repo installs a binary (non-armoured) key as served" {
+    _apt_env; WGET_SERVES=a.gpg
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+}
+
+@test "apt_add_repo refuses a served key that is not pinned, and installs nothing" {
+    _apt_env; WGET_SERVES=b.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not the pinned key"* ]]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+}
+
+@test "apt_add_repo refuses a bundle carrying an extra, unpinned key" {
+    _apt_env; WGET_SERVES=ab.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -ne 0 ]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+}
+
+@test "apt_add_repo accepts a bundle when every key is pinned, spaces and case ignored" {
+    _apt_env; WGET_SERVES=ab.asc
+    local list
+    list="$(tr '[:upper:]' '[:lower:]' <<< "$FPR_A"), $(sed 's/.\{4\}/& /g' <<< "$FPR_B")"
+    run _add --fingerprint "$list"
+    [ "$status" -eq 0 ]
+    [ "$(apt_key_fingerprints "${APT_KEYRING_DIR}/fixture.gpg" | sort | paste -sd, -)" = \
+      "$(printf '%s\n' "$FPR_A" "$FPR_B" | sort | paste -sd, -)" ]
+}
+
+@test "apt_add_repo moves a mismatched existing keyring aside and fetches again" {
+    _apt_env; WGET_SERVES=a.asc
+    mkdir -p "$APT_KEYRING_DIR"
+    cp "${APTKEYS}/b.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ "$(apt_key_fingerprints "${APT_KEYRING_DIR}/fixture.gpg")" = "$FPR_A" ]
+    ls "${APT_KEYRING_DIR}"/fixture.gpg.untrusted.* >/dev/null
+    [ -e "$WGET_CALLED" ]
+}
+
+@test "apt_add_repo leaves a correctly configured, pinned repo alone" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    rm -f "$WGET_CALLED"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already configured"* ]]
+    [ ! -e "$WGET_CALLED" ]
+}
+
+@test "apt_add_repo refuses a glob as a fingerprint without expanding it" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint '*'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"'*' is not a key fingerprint"* ]]
+}
+
+@test "apt_add_repo leaves the keyring world-readable under a restrictive umask" {
+    _apt_env; WGET_SERVES=a.asc
+    # run executes in a subshell, so the umask does not leak out of the test.
+    _add_umask077() { umask 077; _add "$@"; }
+    run _add_umask077 --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ "$(stat -c %a "${APT_KEYRING_DIR}/fixture.gpg")" = 644 ]
+}
+
+@test "apt_add_repo --no-fingerprint installs whatever is served, with a warning" {
+    _apt_env; WGET_SERVES=b.asc
+    run _add --no-fingerprint
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--no-fingerprint"* ]]
+    [ "$(apt_key_fingerprints "${APT_KEYRING_DIR}/fixture.gpg")" = "$FPR_B" ]
+}
+
 # ── apt_install_list parsing ──────────────────────────────────────────────────
 
 @test "apt_install_list skips comments, blanks and whitespace" {

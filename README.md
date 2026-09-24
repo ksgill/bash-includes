@@ -57,6 +57,16 @@ to keep its journal under `~/.local/state` instead; the journal uses `sudo`
 only when the invoking user cannot write where it lives, so nothing under
 `$HOME` ends up root-owned.
 
+**APT signing keys are pinned by the caller.** `apt_add_repo` requires either
+`--fingerprint <FPR>[,<FPR>...]` or an explicit `--no-fingerprint` (since
+v1.5.0); a call with neither is refused. The fingerprints are policy, so they
+live in the calling script, next to the repository URL. A downloaded key and
+an existing keyring must both hold only pinned primary keys; a keyring that
+does not is moved aside and fetched again. `--no-fingerprint` logs a warning
+on every call. To choose a fingerprint, take the publisher's, then confirm the
+key actually signs the repository: `gpgv --keyring <key.gpg>
+dists/<suite>/InRelease`.
+
 ## Use
 
 ```bash
