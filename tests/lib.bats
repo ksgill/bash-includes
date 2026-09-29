@@ -273,9 +273,19 @@ _race_fifo_after_stat() {
             rm -f "$_RACE_FILE"
             mkfifo -m 0644 "$_RACE_FILE"
             if [[ "$_RACE_KIND" == firehose ]]; then
-                # fd 1 is the FIFO itself; close bats' fd 3 so a stray
-                # writer can never hold the run open.
-                yes 1<>"$_RACE_FILE" 2>/dev/null 3>&- 4>&- &
+                # fd 1 is the FIFO itself. Every other inherited descriptor
+                # is closed before exec: this stub runs inside journal.sh's
+                # `mapfile < <(stat …)`, and a writer that kept any pipe the
+                # shell under test later waits on (which ones are open here
+                # differs between bash versions) would hang that wait. A
+                # real FIFO writer is not our child and holds none of them.
+                (
+                    for _fd in /proc/"$BASHPID"/fd/*; do
+                        _fd=${_fd##*/}
+                        (( _fd > 2 )) && eval "exec ${_fd}>&-"
+                    done
+                    exec yes
+                ) 1<>"$_RACE_FILE" 2>/dev/null </dev/null &
                 echo $! > "${TMP}/yes.pid"
             fi
         fi
