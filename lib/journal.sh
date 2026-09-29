@@ -37,6 +37,8 @@ _JOURNAL_SCRIPT=""
 _JOURNAL_VERSION=""
 _JOURNAL_READY=0
 _JOURNAL_SUDO=0
+# Set to 1 (as a local) by journal_record_nohash to suppress sha256_after.
+_JOURNAL_NOHASH=0
 
 # ── _journal_needs_sudo <dir> ─────────────────────────────────────────────────
 # Succeeds when <dir> cannot be created or written as the invoking user. Walks
@@ -58,6 +60,21 @@ _journal_needs_sudo() {
 _journal_priv() {
     if [[ "$_JOURNAL_SUDO" -eq 1 ]]; then
         sudo "$@"
+    else
+        "$@"
+    fi
+}
+
+# The same, for journal_record's append: `sudo -n`, never prompting. A record
+# is written right after the change it describes, so the timestamp is normally
+# fresh; if it has expired the record is lost with a warning rather than the
+# run stopping at a password prompt it did not ask for. journal_init keeps the
+# prompting form above: it runs once at startup, where a prompt is expected,
+# and making it non-interactive would silently disable the journal for any
+# caller that has not primed sudo by then.
+_journal_priv_n() {
+    if [[ "$_JOURNAL_SUDO" -eq 1 ]]; then
+        sudo -n "$@"
     else
         "$@"
     fi
@@ -99,20 +116,122 @@ journal_init() {
     log_info "Journal run ${_JOURNAL_RUN_ID} → ${JOURNAL_FILE}"
 }
 
-# Escape a string for inclusion in a JSON double-quoted value.
+# ── _json_escape <string> ────────────────────────────────────────────────────
+# Print a string escaped for a JSON double-quoted value: backslash and quote,
+# the named escapes \t \n \r \b \f, and \u00XX for every other control
+# character in U+0001..U+001F, which JSON forbids raw. DEL (0x7f) is legal in
+# JSON and passes through. NUL cannot occur in a bash string.
 _json_escape() {
-    local s="$1"
+    local s="$1" i c
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
-    s="${s//	/\\t}"
+    s="${s//$'\t'/\\t}"
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    # Anything left in U+0001..U+001F has no short form. Walk the string only
+    # when one is present; the common case never enters the loop.
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        local out=""
+        for (( i = 0; i < ${#s}; i++ )); do
+            c="${s:i:1}"
+            case "$c" in
+                [$'\001'-$'\037'])
+                    printf -v c '\\u%04x' "'$c" ;;
+            esac
+            out+="$c"
+        done
+        s="$out"
+    fi
     printf '%s' "$s"
 }
 
+# ── _sha256_of <path> ─────────────────────────────────────────────────────────
+# Print the bare 64-hex sha256 of a file whose content anyone on the machine
+# can read, or fail and print nothing.
+#
+# Policy: the journal is mode 0644, so a hash in it is published to every local
+# account — and a hash is a confirmation oracle for anyone holding a candidate
+# content. So a hash is recorded only for content that is world-readable
+# already: the file has the other-read bit AND every ancestor directory has the
+# other-execute bit. A 0600 key never gets one; neither does a 0644 file inside
+# a 0700 directory (~/.ssh/config, /etc/wireguard/*). The record is still
+# written, without sha256_after. Nothing here uses sudo: a file that fails the
+# rule is not worth escalating for, and one that passes it is readable as-is.
+#
+# Symlinks are followed, and the rule is applied to what they resolve to: the
+# path is canonicalised (`realpath -e`), and the canonical file's own mode and
+# its canonical ancestors decide. Whoever can read the content through the
+# canonical path can read it everywhere, so the link's own location does not
+# matter, and a link into a private directory fails the rule like the target.
+#
+# Only an absolute path is considered. Package, unit, interface and user names
+# are journalled as targets too, and a bare name would otherwise be resolved
+# against the caller's working directory.
+#
+# The read opens the canonical path with O_NOFOLLOW and O_NONBLOCK (`dd
+# iflag=nofollow,nonblock`) under `timeout`. A symlink swapped in as the last
+# component after the check fails with ELOOP; a FIFO reads as empty (no
+# writer), fails with EAGAIN (idle writer) or is cut off (endless writer).
+# What a swap can still achieve is a hash of a regular file the swapper owns or
+# can read and write (fs.protected_hardlinks) — content they already have.
+# dd is the coreutils reader that has both open flags (GNU and uutils alike).
+#
+# Residual: O_NOFOLLOW covers only the last path component, and the mode checks
+# precede the read. Someone who can write an ancestor directory can swap an
+# intermediate component for a symlink between check and read, so the rule is
+# only as strong as the ancestors of the journalled path — which for the
+# system paths this journals are writable by root alone.
+#
+# The content is hashed from stdin, never by name: GNU sha256sum prefixes its
+# output line with `\` when the file name holds a backslash or newline. The
+# result must be exactly 64 hex digits, so a failed, killed or partial read
+# yields no field.
+#
+# _JOURNAL_HASH_TIMEOUT (seconds, default 60) bounds each read. It must be a
+# positive integer: `timeout 0` means no limit at all, which would switch the
+# FIFO guard off, so 0 and anything unparseable fall back to the default.
+_JOURNAL_HASH_TIMEOUT="${_JOURNAL_HASH_TIMEOUT:-60}"
+
 _sha256_of() {
-    [[ -f "$1" ]] || return 1
-    sudo sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
+    local f="$1" c d m out t="${_JOURNAL_HASH_TIMEOUT:-60}"
+    local -a dirs=() modes=()
+    [[ "$t" =~ ^[1-9][0-9]*$ ]] || t=60
+    [[ "$f" == /* ]] || return 1
+
+    # The trailing dot survives command substitution, which would otherwise
+    # strip a newline that ends the name.
+    c="$(realpath -e -- "$f" 2>/dev/null && printf .)" || return 1
+    c="${c%.}"
+    c="${c%$'\n'}"
+    [[ "$c" == /* && -f "$c" && ! -L "$c" ]] || return 1
+
+    # Parameter expansion, not $(dirname), which strips a trailing newline.
+    d="$c"
+    while [[ "$d" != "/" ]]; do
+        d="${d%/*}"
+        d="${d:-/}"
+        dirs+=("$d")
+    done
+    # One mode per line, file first; a path stat cannot see prints nothing,
+    # which the count check catches.
+    mapfile -t modes < <(stat -c '%a' -- "$c" "${dirs[@]}" 2>/dev/null)
+    [[ ${#modes[@]} -eq $(( ${#dirs[@]} + 1 )) ]] || return 1
+    for m in "${modes[@]}"; do
+        [[ "$m" =~ ^[0-7]{3,4}$ ]] || return 1
+    done
+    (( (8#${modes[0]} & 8#4) != 0 )) || return 1
+    for m in "${modes[@]:1}"; do
+        (( (8#$m & 8#1) != 0 )) || return 1
+    done
+
+    out="$(set -o pipefail
+           timeout "$t" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
+               | sha256sum 2>/dev/null)" || return 1
+    out="${out%% *}"
+    [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$out"
 }
 
 # ── journal_record <action> <target> [detail] [key=value ...] ─────────────────
@@ -122,6 +241,13 @@ _sha256_of() {
 #
 # Any extra key=value arguments are added as additional JSON fields — used by
 # backup.sh to attach the backup path, for instance.
+#
+# When <target> is an absolute path to a file whose content is world-readable
+# (other-read on the file, other-execute on every ancestor directory), its
+# sha256 is recorded as sha256_after. Any other file is recorded without one —
+# the journal is world-readable, and a hash would publish a confirmation oracle
+# for content that is not. Use journal_record_nohash to leave the hash out of a
+# world-readable file's record as well.
 #
 # Never fatal. A full disk or a read-only /var must not abort a provisioning
 # run partway through; a missing journal line is the lesser loss.
@@ -134,8 +260,10 @@ journal_record() {
         return 0
     fi
 
-    local sha extra="" kv k v
-    sha="$(_sha256_of "$target" 2>/dev/null || true)"
+    local sha="" extra="" kv k v
+    if [[ "${_JOURNAL_NOHASH:-0}" -ne 1 ]]; then
+        sha="$(_sha256_of "$target" 2>/dev/null || true)"
+    fi
 
     for kv in "$@"; do
         k="${kv%%=*}"
@@ -158,8 +286,23 @@ journal_record() {
 
     # flock serialises concurrent appends; without it two scripts running at
     # once can interleave partial lines.
-    if ! printf '%s\n' "$line" | _journal_priv flock "$JOURNAL_LOCK" tee -a "$JOURNAL_FILE" >/dev/null 2>&1; then
+    if ! printf '%s\n' "$line" | _journal_priv_n flock "$JOURNAL_LOCK" tee -a "$JOURNAL_FILE" >/dev/null 2>&1; then
         log_warn "Could not write journal entry for ${target}"
     fi
     return 0
+}
+
+# ── journal_record_nohash <action> <target> [detail] [key=value ...] ──────────
+# Exactly journal_record, but never records sha256_after for <target>.
+#
+# A file that is not world-readable never gets a hash in any case (see
+# _sha256_of), so a private key or a 0600 config needs nothing extra. This is
+# for a world-readable file whose hash should still not be kept, and for a
+# caller that wants the choice visible at the call site. It is a separate
+# function rather than a reserved key=value so it cannot collide with a
+# caller's own field name, and so a script built against an older journal.sh
+# fails loudly instead of silently hashing anyway.
+journal_record_nohash() {
+    local _JOURNAL_NOHASH=1
+    journal_record "$@"
 }

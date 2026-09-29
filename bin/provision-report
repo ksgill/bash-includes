@@ -35,9 +35,16 @@ Options:
 Verify status:
   OK        file still matches the hash recorded when it was changed
   CHANGED   file has been modified since — by something other than that script
+  PRESENT   file still exists; no hash was recorded, so content is not checked
   MISSING   file no longer exists
-  NOREAD    file could not be read, so drift could not be checked
-  -         no hash was recorded (package installs, deletions)
+  NOREAD    file could not be checked (not world-readable now, or its
+            existence cannot be determined)
+  -         nothing to check (package installs, deletions, non-path targets)
+
+Hashes are recorded, and re-checked, only for content anyone on the machine
+can read: other-read on the file and other-execute on every ancestor
+directory. Private keys, 0600 configs and anything under a 0700 directory are
+tracked by presence alone (PRESENT / MISSING).
 HELP
 }
 
@@ -61,18 +68,183 @@ if [[ ! -r "$JOURNAL_FILE" ]]; then
 fi
 
 # Extract one string field from a flat JSON object, honouring backslash escapes.
+# Escapes are decoded in one left-to-right pass: replacing them one kind at a
+# time turned the JSON text `a\\name` (a backslash, then "name") into a newline.
+# \u00XX covers the control characters journal.sh escapes; any other \uXXXX is
+# left as written, since the journal never emits one.
 jget() {
-    local line="$1" key="$2"
-    if [[ "$line" =~ \"$key\":\"(([^\"\\]|\\.)*)\" ]]; then
-        local v="${BASH_REMATCH[1]}"
-        v="${v//\\n/$'\n'}"; v="${v//\\t/$'\t'}"
-        v="${v//\\\"/\"}";   v="${v//\\\\/\\}"
+    local line="$1" key="$2" v out="" c hex i
+    [[ "$line" =~ \"$key\":\"(([^\"\\]|\\.)*)\" ]] || return 0
+    v="${BASH_REMATCH[1]}"
+    if [[ "$v" != *\\* ]]; then
         printf '%s' "$v"
+        return 0
+    fi
+    for (( i = 0; i < ${#v}; i++ )); do
+        c="${v:i:1}"
+        if [[ "$c" == "\\" ]]; then
+            i=$((i + 1))
+            c="${v:i:1}"
+            case "$c" in
+                n) c=$'\n' ;;
+                t) c=$'\t' ;;
+                r) c=$'\r' ;;
+                b) c=$'\b' ;;
+                f) c=$'\f' ;;
+                u)
+                    hex="${v:i+1:4}"
+                    if [[ "$hex" =~ ^00[0-7][0-9a-fA-F]$ && "$hex" != "0000" ]]; then
+                        printf -v c '%b' "\\x${hex:2}"
+                        i=$((i + 4))
+                    else
+                        c="\\u"
+                    fi
+                    ;;
+                # \" \\ \/ stand for the character itself.
+            esac
+        fi
+        out+="$c"
+    done
+    printf '%s' "$out"
+}
+
+# ── file_sha256 <path> ────────────────────────────────────────────────────────
+# Print the bare 64-hex sha256 of a file whose content anyone on the machine
+# can read, or fail and print nothing. Mirrors _sha256_of in lib/journal.sh —
+# verify must apply the same rule and hash the same way as the journal did, or
+# every difference in method reads as drift. It is copied rather than sourced
+# because this command is deliberately standalone: it runs on machines that
+# have the built installers but no bash-includes checkout. See journal.sh for
+# the full reasoning; in short:
+#   - world-readable content only: other-read on the canonical file and
+#     other-execute on each canonical ancestor; symlinks are resolved
+#     (`realpath -e`) and the rule applies to what they point at. No sudo;
+#   - absolute paths only, so a bare target name is never resolved against the
+#     working directory, where a planted symlink could redirect it;
+#   - hashed from stdin, never by name (sha256sum prefixes `\` to the line for
+#     a name holding a backslash or newline);
+#   - dd with O_NOFOLLOW and O_NONBLOCK under `timeout`, so a swapped-in
+#     symlink or FIFO can neither redirect nor hang the read; the timeout must
+#     be a positive integer, since `timeout 0` means no limit.
+# Residual: O_NOFOLLOW covers only the last path component; a symlink planted
+# as an intermediate directory between check and read is still followed.
+HASH_TIMEOUT="${_JOURNAL_HASH_TIMEOUT:-60}"
+[[ "$HASH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || HASH_TIMEOUT=60
+
+file_sha256() {
+    local f="$1" c d m out
+    local -a dirs=() modes=()
+    [[ "$f" == /* ]] || return 1
+    c="$(realpath -e -- "$f" 2>/dev/null && printf .)" || return 1
+    c="${c%.}"
+    c="${c%$'\n'}"
+    [[ "$c" == /* && -f "$c" && ! -L "$c" ]] || return 1
+    d="$c"
+    while [[ "$d" != "/" ]]; do
+        d="${d%/*}"
+        d="${d:-/}"
+        dirs+=("$d")
+    done
+    mapfile -t modes < <(stat -c '%a' -- "$c" "${dirs[@]}" 2>/dev/null)
+    [[ ${#modes[@]} -eq $(( ${#dirs[@]} + 1 )) ]] || return 1
+    for m in "${modes[@]}"; do
+        [[ "$m" =~ ^[0-7]{3,4}$ ]] || return 1
+    done
+    (( (8#${modes[0]} & 8#4) != 0 )) || return 1
+    for m in "${modes[@]:1}"; do
+        (( (8#$m & 8#1) != 0 )) || return 1
+    done
+    out="$(set -o pipefail
+           timeout "$HASH_TIMEOUT" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
+               | sha256sum 2>/dev/null)" || return 1
+    out="${out%% *}"
+    [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$out"
+}
+
+# ── path_state <path> ─────────────────────────────────────────────────────────
+# Print present, absent or unknown. An unprivileged `-e` answers when the path
+# is visible, or when the nearest existing ancestor is a directory we can
+# search. Behind one we cannot (a 0700 /etc/wireguard), `sudo -n test -e`
+# answers instead: it reads metadata only — never content — so it does not
+# touch the world-readable rule, and without it every root-only file the
+# journal tracks by presence would be unknowable. `-n` never prompts; a sudo
+# that cannot run leaves the answer unknown. A relative path is never judged:
+# it would be resolved against the working directory, not the machine.
+path_state() {
+    local f="$1" d
+    if [[ "$f" != /* ]]; then
+        printf 'unknown'
+        return 0
+    fi
+    if [[ -e "$f" ]]; then
+        printf 'present'
+        return 0
+    fi
+    d="$f"
+    # Parameter expansion, not $(dirname), which strips a trailing newline.
+    while [[ ! -e "$d" && "$d" != "/" ]]; do
+        d="${d%/*}"
+        d="${d:-/}"
+    done
+    if [[ -d "$d" && -x "$d" ]]; then
+        printf 'absent'
+    elif ! sudo -n true 2>/dev/null; then
+        printf 'unknown'
+    elif sudo -n test -e "$f" 2>/dev/null; then
+        printf 'present'
+    else
+        printf 'absent'
     fi
 }
 
+# ── vis <string> ──────────────────────────────────────────────────────────────
+# Render a journalled string for the terminal. jget returns the exact bytes,
+# so a target holding ESC would otherwise reach the terminal as a live escape
+# sequence. Display only: comparisons and file operations use the exact value.
+#
+# In a UTF-8 locale every character that is not [[:print:]] — C0, DEL, C1 — is
+# shown as \xNN (or \uNNNN above 0x7f); printable multibyte text is untouched.
+# In any other locale bash sees bytes, and [[:cntrl:]] misses a UTF-8-encoded
+# C1 control such as C2 9B (CSI), which a UTF-8 terminal still obeys; there,
+# control bytes and every byte 0x80-0x9f are shown as \xNN. That leaves the
+# lead byte of such a pair, and all of 0xa0-0xff, as they were, so ordinary
+# accented names still read correctly on a UTF-8 terminal, and on an 8-bit
+# terminal 0x80-0x9f is exactly its C1 range.
+_VIS_UTF8=0
+_vis_probe=$'\xc3\xa9'
+[[ ${#_vis_probe} -eq 1 ]] && _VIS_UTF8=1
+unset _vis_probe
+
+vis() {
+    local s="$1" out="" c n i
+    if [[ "$_VIS_UTF8" -eq 1 ]]; then
+        if [[ "$s" != *[![:print:]]* ]]; then
+            printf '%s' "$s"
+            return 0
+        fi
+    elif [[ "$s" != *[[:cntrl:]]* && "$s" != *[$'\x80'-$'\x9f']* ]]; then
+        printf '%s' "$s"
+        return 0
+    fi
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$_VIS_UTF8" -eq 1 && "$c" != [[:print:]] ]] \
+            || [[ "$_VIS_UTF8" -eq 0 && ( "$c" == [[:cntrl:]] || "$c" == [$'\x80'-$'\x9f'] ) ]]; then
+            printf -v n '%d' "'$c"
+            if (( n < 128 || _VIS_UTF8 == 0 )); then
+                printf -v c '\\x%02x' "$(( n & 0xff ))"
+            else
+                printf -v c '\\u%04x' "$n"
+            fi
+        fi
+        out+="$c"
+    done
+    printf '%s' "$out"
+}
+
 last_run=""
-total=0; ok=0; changed=0; missing=0; unreadable=0
+total=0; ok=0; changed=0; missing=0; unreadable=0; present=0
 targets_seen=()
 
 while IFS= read -r line; do
@@ -91,11 +263,14 @@ while IFS= read -r line; do
         continue
     fi
 
-    target="$(jget "$line" target)"
+    # The trailing dot survives command substitution, which would otherwise
+    # strip a newline that ends the path.
+    target="$(jget "$line" target; printf .)"
+    target="${target%.}"
 
     if [[ "$TARGETS" -eq 1 ]]; then
         # Deduplicated at the end — a target changed by five runs is one line.
-        targets_seen+=("$target")
+        targets_seen+=("$(vis "$target")")
         continue
     fi
 
@@ -110,26 +285,34 @@ while IFS= read -r line; do
     if [[ "$run" != "$last_run" ]]; then
         [[ -n "$last_run" ]] && printf '\n'
         printf '%s● run %s  %s  %s%s\n' \
-            "$C_CYN" "$run" "$script" "${version:-unknown}" "$C_RST"
+            "$C_CYN" "$(vis "$run")" "$(vis "$script")" "$(vis "${version:-unknown}")" "$C_RST"
         last_run="$run"
     fi
 
     status=""
     if [[ "$VERIFY" -eq 1 ]]; then
+        state=""
         if [[ -z "$sha" ]]; then
-            status="${C_DIM}   -    ${C_RST}"
-        elif [[ ! -e "$target" ]]; then
+            # No hash: a file that is not world-readable, a nohash record, or
+            # not a file at all. A path that should still exist is checked for
+            # presence; deletions and bare names have nothing to check.
+            if [[ "$target" == /* && "$action" != "delete" && "$action" != "remove" ]]; then
+                state="$(path_state "$target")"
+            fi
+            case "$state" in
+                present) status="${C_CYN}PRESENT${C_RST} "; present=$((present + 1)) ;;
+                absent)  status="${C_RED}MISSING${C_RST} "; missing=$((missing + 1)) ;;
+                unknown) status="${C_YEL}NOREAD ${C_RST} "; unreadable=$((unreadable + 1)) ;;
+                *)       status="${C_DIM}   -    ${C_RST}" ;;
+            esac
+        elif [[ "$(path_state "$target")" == "absent" ]]; then
             status="${C_RED}MISSING${C_RST} "; missing=$((missing + 1))
         else
-            # Most journalled files are world-readable, so try unprivileged
-            # first and only escalate when we have to. An unreadable file must
-            # report UNREADABLE, never CHANGED — reporting drift we could not
-            # actually measure would send you chasing a change that never
-            # happened.
-            now="$(sha256sum -- "$target" 2>/dev/null | cut -d' ' -f1 || true)"
-            if [[ -z "$now" ]]; then
-                now="$(sudo -n sha256sum -- "$target" 2>/dev/null | cut -d' ' -f1 || true)"
-            fi
+            # A file that fails the world-readable rule now — or cannot be
+            # read — must report NOREAD, never CHANGED: reporting drift we
+            # could not actually measure would send you chasing a change that
+            # never happened.
+            now="$(file_sha256 "$target" || true)"
 
             if [[ -z "$now" ]]; then
                 status="${C_YEL}NOREAD ${C_RST} "; unreadable=$((unreadable + 1))
@@ -141,9 +324,9 @@ while IFS= read -r line; do
         fi
     fi
 
-    printf '  %s%s  %-8s %s\n' "$status" "${ts:0:19}" "$action" "$target"
-    [[ -n "$detail" ]] && printf '            %s%s%s\n' "$C_DIM" "$detail" "$C_RST"
-    [[ -n "$backup" ]] && printf '            %sbackup: %s%s\n' "$C_DIM" "$backup" "$C_RST"
+    printf '  %s%s  %-8s %s\n' "$status" "$(vis "${ts:0:19}")" "$(vis "$action")" "$(vis "$target")"
+    [[ -n "$detail" ]] && printf '            %s%s%s\n' "$C_DIM" "$(vis "$detail")" "$C_RST"
+    [[ -n "$backup" ]] && printf '            %sbackup: %s%s\n' "$C_DIM" "$(vis "$backup")" "$C_RST"
 done < "$JOURNAL_FILE"
 
 if [[ "$TARGETS" -eq 1 ]]; then
@@ -152,7 +335,7 @@ fi
 
 if [[ "$RAW" -eq 0 && "$TARGETS" -eq 0 ]]; then
     printf '\n%d record(s)' "$total"
-    [[ "$VERIFY" -eq 1 ]] && printf '  —  %d ok, %d changed, %d missing, %d unreadable' \
-        "$ok" "$changed" "$missing" "$unreadable"
+    [[ "$VERIFY" -eq 1 ]] && printf '  —  %d ok, %d changed, %d missing, %d unreadable, %d present' \
+        "$ok" "$changed" "$missing" "$unreadable" "$present"
     printf '\n'
 fi

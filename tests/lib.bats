@@ -8,10 +8,21 @@
 #
 # sudo is stubbed so everything runs unprivileged inside a temp tree.
 
+# For `run !`. A bare `! cmd` does not fail a bats test unless it is the last
+# line: set -e ignores a negated command (shellcheck SC2314).
+bats_require_minimum_version 1.5.0
+
 setup() {
     LIB="${BATS_TEST_DIRNAME}/../lib"
     BIN="${BATS_TEST_DIRNAME}/../bin"
     TMP="$(mktemp -d)"
+    # The journal hashes only world-readable content (other-read on the file,
+    # other-execute on every ancestor). mktemp -d is 0700, and the caller's
+    # umask may be 002 or 077, so pin both or every hashing test would see a
+    # private file. This assumes TMPDIR's own ancestors are world-searchable,
+    # as /tmp is.
+    chmod 0755 "$TMP"
+    umask 022
 
     # shellcheck disable=SC2317
     sudo() { case "${1:-}" in -v|-n) shift ;; esac; [[ $# -eq 0 ]] && return 0; "$@"; }
@@ -53,6 +64,10 @@ _git_home() {
 }
 
 teardown() {
+    # The FIFO race tests start a background writer; never leave it running.
+    if [[ -f "${TMP}/yes.pid" ]]; then
+        kill "$(cat "${TMP}/yes.pid")" 2>/dev/null || true
+    fi
     rm -rf "${TMP}"
 }
 
@@ -126,6 +141,244 @@ print(d['detail'])
     printf 'SUPERSECRETVALUE\n' > "${TMP}/secret"
     journal_record modify "${TMP}/secret" "wrote credentials"
     ! grep -q SUPERSECRETVALUE "$JOURNAL_FILE"
+}
+
+# Every line of the journal must parse as a JSON object.
+_journal_valid_json() {
+    python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin]' < "$JOURNAL_FILE"
+}
+
+@test "_json_escape escapes every control character JSON forbids raw" {
+    run _json_escape $'a\001b\bc\fd\037e\x7ff'
+    [ "$output" = 'a\u0001b\bc\fd\u001fe'$'\x7f''f' ]
+}
+
+@test "_json_escape escapes control characters under the C locale" {
+    run env LC_ALL=C bash -c '. "$1/log.sh"; . "$1/journal.sh"; _json_escape $'"'"'x\001\033y'"'"'' _ "$LIB"
+    [ "$output" = 'x\u0001\u001by' ]
+}
+
+@test "journal_record writes valid JSON for fields holding control characters" {
+    journal_init "test" "v1"
+    local s=$'ctl \001 bs \b ff \f esc \033 us \037 del \x7f tab \t nl \n cr \r end'
+    journal_record modify "/etc/x${s}" "$s" "key${s}=val${s}"
+    _journal_valid_json
+    run python3 -c "
+import json
+d = json.loads(open('${JOURNAL_FILE}').readline())
+print(d['detail'] == d['target'][len('/etc/x'):], end='')
+"
+    [ "$output" = "True" ]
+    run python3 -c "
+import json
+print(json.loads(open('${JOURNAL_FILE}').readline())['detail'], end='')
+"
+    [ "$output" = "$s" ]
+}
+
+@test "journal_record hashes a file whose name holds a backslash and a newline" {
+    # GNU sha256sum prefixes its line with a backslash for such a name when
+    # given it as an argument; that prefix must not reach the journal.
+    journal_init "test" "v1"
+    local f="${TMP}/"$'back\\slash\nnewline'
+    printf 'content\n' > "$f"
+    journal_record modify "$f" "odd name"
+    _journal_valid_json
+    local want
+    want="$(sha256sum < "$f")"
+    want="${want%% *}"
+    run python3 -c "
+import json
+print(json.loads(open('${JOURNAL_FILE}').readline())['sha256_after'], end='')
+"
+    [ "$output" = "$want" ]
+}
+
+@test "journal_record hashes only world-readable content, and never uses sudo" {
+    # Any sudo call at all is a failure: hashing must not escalate.
+    # shellcheck disable=SC2317
+    sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.calls"; return 1; }
+    mkdir -m 0755 "${TMP}/pub"
+    mkdir -m 0700 "${TMP}/priv"
+    mkdir -m 0711 "${TMP}/xonly"
+    printf 'a\n' > "${TMP}/pub/a.conf";   chmod 0644 "${TMP}/pub/a.conf"
+    printf 'k\n' > "${TMP}/pub/key";      chmod 0600 "${TMP}/pub/key"
+    printf 'g\n' > "${TMP}/pub/grp";      chmod 0640 "${TMP}/pub/grp"
+    printf 'b\n' > "${TMP}/priv/b.conf";  chmod 0644 "${TMP}/priv/b.conf"
+    printf 'c\n' > "${TMP}/xonly/c.conf"; chmod 0644 "${TMP}/xonly/c.conf"
+    ln -s "${TMP}/priv/b.conf" "${TMP}/pub/link-to-priv"
+    ln -s "${TMP}/pub/a.conf" "${TMP}/priv/link-to-pub"
+    journal_init "test" "v1"
+    local t
+    for t in pub/a.conf pub/key pub/grp priv/b.conf xonly/c.conf \
+             pub/link-to-priv priv/link-to-pub; do
+        journal_record modify "${TMP}/${t}" "$t"
+    done
+    _journal_valid_json
+    [ ! -e "${TMP}/sudo.calls" ]
+    # target -> recorded hash, or "-" for none
+    run python3 -c "
+import json, os, sys
+for l in open(os.environ['JOURNAL_FILE']):
+    d = json.loads(l)
+    print(d['detail'], d.get('sha256_after', '-'))
+"
+    local want_a want_c
+    want_a="$(sha256sum < "${TMP}/pub/a.conf")"; want_a="${want_a%% *}"
+    want_c="$(sha256sum < "${TMP}/xonly/c.conf")"; want_c="${want_c%% *}"
+    [ "${lines[0]}" = "pub/a.conf ${want_a}" ]         # 0644 in 0755 dirs
+    [ "${lines[1]}" = "pub/key -" ]                    # 0600
+    [ "${lines[2]}" = "pub/grp -" ]                    # 0640, no other-read
+    [ "${lines[3]}" = "priv/b.conf -" ]                # 0644 inside 0700
+    [ "${lines[4]}" = "xonly/c.conf ${want_c}" ]       # 0711 dir: search is enough
+    [ "${lines[5]}" = "pub/link-to-priv -" ]           # rule applies to the target
+    [ "${lines[6]}" = "priv/link-to-pub ${want_a}" ]   # ...whichever way round
+}
+
+@test "journal_record_nohash records the change without a hash" {
+    journal_init "test" "v1"
+    printf 'private\n' > "${TMP}/key"
+    journal_record_nohash create "${TMP}/key" "generated key" "kind=private"
+    journal_record create "${TMP}/key" "same file, hashed"
+    _journal_valid_json
+    run ! grep -q '"sha256_after"' <(sed -n 1p "$JOURNAL_FILE")
+    grep -q '"kind":"private"' <(sed -n 1p "$JOURNAL_FILE")
+    grep -q '"target":"'"${TMP}"'/key"' <(sed -n 1p "$JOURNAL_FILE")
+    # The opt-out is per call; it must not leak into the next record.
+    grep -q '"sha256_after"' <(sed -n 2p "$JOURNAL_FILE")
+}
+
+@test "journal_record does not hash a bare-name target, even through a planted symlink" {
+    printf 'public\n' > "${TMP}/public"
+    mkdir "${TMP}/cwd"
+    ln -s "${TMP}/public" "${TMP}/cwd/lxd"
+    journal_init "test" "v1"
+    (cd "${TMP}/cwd" && journal_record install lxd "snap installed")
+    _journal_valid_json
+    run ! grep -q '"sha256_after"' "$JOURNAL_FILE"
+}
+
+# Stand-in for the race: the first `stat` call (the mode check in _sha256_of)
+# answers for the regular file, then swaps a FIFO in at the same path before
+# the read. $1 = "idle" (no writer) or "firehose" (a writer that never stops:
+# `yes` holds the FIFO open read-write, so the pipe is full before dd opens it).
+_race_fifo_after_stat() {
+    _RACE_FILE="$1"
+    _RACE_KIND="$2"
+    # shellcheck disable=SC2317
+    stat() {
+        local rc=0
+        command stat "$@" || rc=$?
+        if [[ ! -p "$_RACE_FILE" ]]; then
+            rm -f "$_RACE_FILE"
+            mkfifo -m 0644 "$_RACE_FILE"
+            if [[ "$_RACE_KIND" == firehose ]]; then
+                # fd 1 is the FIFO itself; close bats' fd 3 so a stray
+                # writer can never hold the run open.
+                yes 1<>"$_RACE_FILE" 2>/dev/null 3>&- 4>&- &
+                echo $! > "${TMP}/yes.pid"
+            fi
+        fi
+        return "$rc"
+    }
+}
+
+@test "journal_record does not hang when a FIFO is swapped in after the mode check" {
+    printf 'regular\n' > "${TMP}/racy"
+    run timeout 10 bash -c '
+        set -euo pipefail
+        . "$1/log.sh"; . "$1/journal.sh"
+        eval "$2"
+        _race_fifo_after_stat "$3" idle
+        journal_init test v1
+        journal_record modify "$3" "raced"
+        echo survived
+    ' _ "$LIB" "$(declare -f _race_fifo_after_stat)" "${TMP}/racy"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *survived* ]]
+    [ -p "${TMP}/racy" ]
+    _journal_valid_json
+}
+
+@test "journal_record cuts off a FIFO whose writer never stops" {
+    printf 'regular\n' > "${TMP}/firehose"
+    # The stub records the writer's pid under $TMP for teardown to kill.
+    export TMP
+    run timeout 20 bash -c '
+        . "$1/log.sh"; . "$1/journal.sh"
+        eval "$2"
+        _race_fifo_after_stat "$3" firehose
+        _JOURNAL_HASH_TIMEOUT=2
+        journal_init test v1
+        journal_record modify "$3" "firehose"
+        echo survived
+    ' _ "$LIB" "$(declare -f _race_fifo_after_stat)" "${TMP}/firehose"
+    # The writer really ran, so the cut-off was exercised, not skipped.
+    [ -s "${TMP}/yes.pid" ]
+    kill "$(cat "${TMP}/yes.pid")" 2>/dev/null || true
+    [ "$status" -eq 0 ]
+    [[ "$output" == *survived* ]]
+    [ -p "${TMP}/firehose" ]
+    run ! grep -q '"sha256_after"' "$JOURNAL_FILE"
+}
+
+@test "a hash timeout of 0 or garbage falls back to the default" {
+    # timeout(1) treats 0 as "no limit", which would switch off the guard
+    # against a FIFO whose writer never stops.
+    printf 'x\n' > "${TMP}/pub.conf"
+    local v
+    export TMP
+    for v in 0 00 abc -5 ''; do
+        rm -f "${TMP}/timeout.calls"
+        run bash -c '
+            timeout() { printf "%s\n" "$*" >> "$TMP/timeout.calls"; command timeout "$@"; }
+            . "$1/log.sh"; . "$1/journal.sh"
+            _JOURNAL_HASH_TIMEOUT="$3"
+            journal_init test v1 >/dev/null
+            journal_record modify "$2" "t"
+        ' _ "$LIB" "${TMP}/pub.conf" "$v"
+        grep -q '^60 dd ' "${TMP}/timeout.calls" \
+            || { echo "value '$v': $(cat "${TMP}/timeout.calls" 2>&1)"; false; }
+    done
+}
+
+@test "journal_record does not prompt for sudo when the timestamp has expired" {
+    journal_init "test" "v1"
+    # Pretend the journal needs root, and sudo's timestamp has run out: -n
+    # fails, and anything without -n would have prompted.
+    _JOURNAL_SUDO=1
+    # shellcheck disable=SC2317
+    sudo() {
+        [[ "${1:-}" == -n ]] && return 1
+        printf '%s\n' "$*" >> "${TMP}/prompted"
+        return 1
+    }
+    run journal_record install some-package "x"
+    [ "$status" -eq 0 ]
+    [ ! -e "${TMP}/prompted" ]
+    [[ "$output" == *"Could not write journal entry"* ]]
+}
+
+@test "journal_record stays non-fatal and hashless on an unreadable file" {
+    [[ "$EUID" -eq 0 ]] && skip "root can read anywhere"
+    printf 'x\n' > "${TMP}/locked"
+    chmod 0000 "${TMP}/locked"
+    # sudo is unavailable: the hash must be omitted, never empty or partial,
+    # and the caller's set -euo pipefail must not be tripped.
+    run bash -c '
+        set -euo pipefail
+        sudo() { return 1; }
+        . "$1/log.sh"; . "$1/journal.sh"
+        journal_init test v1
+        journal_record modify "$2" "unreadable"
+        echo survived
+    ' _ "$LIB" "${TMP}/locked"
+    chmod 0600 "${TMP}/locked"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *survived* ]]
+    [ "$(wc -l < "$JOURNAL_FILE")" -eq 1 ]
+    _journal_valid_json
+    run ! grep -q '"sha256_after"' "$JOURNAL_FILE"
 }
 
 @test "_journal_needs_sudo is false for a missing dir under a writable parent" {
@@ -455,6 +708,169 @@ STUB
     run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify
     [[ "$output" == *"MISSING"* ]]
     [[ "$output" == *"1 missing"* ]]
+}
+
+@test "provision-report --verify matches a file named with a backslash and a newline" {
+    # sha256sum given such a name prefixes its line with a backslash; verify
+    # must hash the way journal_record did, or it reports CHANGED forever.
+    journal_init "reporter" "v9"
+    local f="${TMP}/"$'odd\\name\nhere.conf'
+    printf 'before\n' > "$f"
+    journal_record modify "$f" "recorded"
+
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"1 ok, 0 changed"* ]]
+
+    printf 'after\n' > "$f"
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 ok, 1 changed"* ]]
+}
+
+@test "provision-report decodes escapes in one pass" {
+    # A backslash followed by "n" is not a newline, and \u00XX is a control
+    # character; decoding one escape kind at a time got the first wrong.
+    journal_init "reporter" "v9"
+    local t=$'/etc/a\\new\001x\\\\"q'
+    journal_record modify "$t" "d"
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --targets
+    [ "$status" -eq 0 ]
+    # --targets is display output: the \u0001 decodes to a control character,
+    # which is then shown as \x01.
+    [ "$output" = '/etc/a\new\x01x\\"q' ]
+}
+
+@test "provision-report shows control characters in journalled strings visibly" {
+    journal_init "reporter" "v9"
+    journal_record modify $'/etc/a\033[31mred' $'detail \033]0;title\007'
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *$'\033'* && "$output" != *$'\007'* ]]
+    [[ "$output" == *'/etc/a\x1b[31mred'* ]]
+    [[ "$output" == *'detail \x1b]0;title\x07'* ]]
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --targets
+    [ "$output" = '/etc/a\x1b[31mred' ]
+}
+
+@test "provision-report falls back to the default hash timeout for 0" {
+    printf 'x\n' > "${TMP}/pub.conf"
+    journal_init "reporter" "v9"
+    journal_record modify "${TMP}/pub.conf" "d"
+    local real
+    real="$(command -v timeout)"
+    mkdir "${TMP}/stub"
+    cat > "${TMP}/stub/timeout" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${TMP}/timeout.calls"
+exec "${real}" "\$@"
+STUB
+    chmod 0755 "${TMP}/stub/timeout"
+    run env PATH="${TMP}/stub:$PATH" JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 \
+        _JOURNAL_HASH_TIMEOUT=0 "${BIN}/provision-report" --verify
+    [[ "$output" == *"1 ok"* ]]
+    grep -q '^60 dd ' "${TMP}/timeout.calls"
+}
+
+@test "provision-report escapes a UTF-8 C1 control under the C locale" {
+    # C2 9B is U+009B, CSI. Under LC_ALL=C bash sees two bytes, neither of
+    # them [[:cntrl:]], but a UTF-8 terminal still decodes the pair as CSI.
+    journal_init "reporter" "v9"
+    journal_record modify $'/etc/a\xc2\x9b31mred' "d"
+    run env LC_ALL=C JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --targets
+    [ "$status" -eq 0 ]
+    [[ "$output" != *$'\x9b'* ]]
+    [ "$output" = '/etc/a'$'\xc2''\x9b31mred' ]
+}
+
+@test "provision-report keeps printable multibyte names intact under a UTF-8 locale" {
+    journal_init "reporter" "v9"
+    journal_record modify $'/etc/caf\u00e9-\u00db\u009b' "d"
+    run env LC_ALL=C.UTF-8 JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --targets
+    [ "$status" -eq 0 ]
+    [ "$output" = $'/etc/caf\u00e9-\u00db''\u009b' ]
+}
+
+@test "provision-report --verify will not hash a bare name, a private symlink target or a FIFO" {
+    printf 'content\n' > "${TMP}/public"
+    printf 'content\n' > "${TMP}/shadow"
+    chmod 0600 "${TMP}/shadow"
+    local sha
+    sha="$(sha256sum < "${TMP}/public")"; sha="${sha%% *}"
+    mkdir "${TMP}/cwd"
+    # Resolved against the working directory, the bare name would match.
+    ln -s "${TMP}/public" "${TMP}/cwd/lxd"
+    ln -s "${TMP}/shadow" "${TMP}/to-shadow"
+    mkfifo -m 0644 "${TMP}/fifo"
+    # Records as a forged or older journal might hold them, each with a hash.
+    mkdir -p "$JOURNAL_DIR"
+    local t
+    for t in lxd "${TMP}/to-shadow" "${TMP}/fifo"; do
+        printf '{"ts":"2026-01-01T00:00:00Z","run":"r1","script":"s","action":"modify","target":"%s","detail":"d","sha256_after":"%s"}\n' \
+            "$t" "$sha" >> "$JOURNAL_FILE"
+    done
+    run bash -c 'cd "$1" && JOURNAL_FILE="$2" NO_COLOR=1 timeout 20 "$3/provision-report" --verify' \
+        _ "${TMP}/cwd" "$JOURNAL_FILE" "$BIN"
+    # 124 would be timeout(1) killing a hung read.
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 ok, 0 changed, 0 missing, 3 unreadable, 0 present"* ]]
+}
+
+@test "provision-report --verify tracks a private file by presence: PRESENT, then MISSING" {
+    printf 'secret\n' > "${TMP}/key"
+    chmod 0600 "${TMP}/key"
+    journal_init "reporter" "v9"
+    journal_record create "${TMP}/key" "private key"
+    journal_record delete "${TMP}/old.conf" "removed"
+    run ! grep -q '"sha256_after"' "$JOURNAL_FILE"
+
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PRESENT"* ]]
+    # The deletion is not a missing file: nothing to check.
+    [[ "$output" == *"0 ok, 0 changed, 0 missing, 0 unreadable, 1 present"* ]]
+
+    rm -f "${TMP}/key"
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify
+    [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 0 present"* ]]
+}
+
+@test "provision-report --verify checks a root-only file's presence through sudo -n test -e" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    mkdir -m 0700 "${TMP}/rootonly"
+    printf 'x\n' > "${TMP}/rootonly/kept.conf"
+    printf 'x\n' > "${TMP}/rootonly/gone.conf"
+    journal_init "reporter" "v9"
+    journal_record modify "${TMP}/rootonly/kept.conf" "recorded"
+    journal_record modify "${TMP}/rootonly/gone.conf" "recorded"
+    run ! grep -q '"sha256_after"' "$JOURNAL_FILE"
+    rm -f "${TMP}/rootonly/gone.conf"
+    chmod 0000 "${TMP}/rootonly"
+    # Stand-in for root: opens the directory for the one command it runs, and
+    # logs it. Content must never be read through it.
+    mkdir "${TMP}/stub"
+    cat > "${TMP}/stub/sudo" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == -n ]] && shift
+printf '%s\n' "$*" >> "${TMP}/sudo.calls"
+[[ -n "${SUDO_BROKEN:-}" ]] && exit 1
+chmod 0700 "${TMP}/rootonly"; rc=0; "$@" || rc=$?; chmod 0000 "${TMP}/rootonly"
+exit "$rc"
+STUB
+    chmod 0755 "${TMP}/stub/sudo"
+    unset -f sudo
+
+    run env PATH="${TMP}/stub:$PATH" TMP="$TMP" JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 \
+        "${BIN}/provision-report" --verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 1 present"* ]]
+    run ! grep -qv '^true$\|^test -e ' "${TMP}/sudo.calls"
+
+    # Without a working sudo the answer is unknown, never MISSING.
+    run env PATH="${TMP}/stub:$PATH" TMP="$TMP" SUDO_BROKEN=1 JOURNAL_FILE="$JOURNAL_FILE" \
+        NO_COLOR=1 "${BIN}/provision-report" --verify
+    chmod 0700 "${TMP}/rootonly"
+    [[ "$output" == *"0 ok, 0 changed, 0 missing, 2 unreadable, 0 present"* ]]
 }
 
 # ── cleanup stack ─────────────────────────────────────────────────────────────

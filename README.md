@@ -51,11 +51,19 @@ state for everything else and is overwritten each run. See `lib/backup.sh`.
 **Persistent changes are journalled** to `/var/lib/provision/changes.jsonl` —
 state, not logs, so it survives log rotation. Run transcripts go to
 `/var/log/<script-name>/` separately. The journal records paths, hashes and
-descriptions; never file contents, because callers handle private keys.
+descriptions; never file contents, because callers handle private keys. The
+system journal is world-readable, so a hash is recorded only for content that
+already is: other-read on the file and other-execute on every ancestor directory. A
+private key, a 0600 config or anything under a 0700 directory is journalled
+without a hash, and `provision-report --verify` tracks it by presence alone.
+`journal_record_nohash` leaves the hash out of a world-readable file's record
+too.
 A script that runs per-user can set `JOURNAL_DIR` (before or after sourcing)
 to keep its journal under `~/.local/state` instead; the journal uses `sudo`
 only when the invoking user cannot write where it lives, so nothing under
-`$HOME` ends up root-owned.
+`$HOME` ends up root-owned. The same hashing rule applies there: with a 0750
+home directory (Ubuntu's default since 24.04), files under `$HOME` fail the
+other-execute test and are tracked by presence only.
 
 **APT signing keys are pinned by the caller.** `apt_add_repo` requires either
 `--fingerprint <FPR>[,<FPR>...]` or an explicit `--no-fingerprint` (since
@@ -127,6 +135,12 @@ uncommitted tree.
 provision-report              # what has been done to this box
 provision-report --verify     # …and has anything changed since
 ```
+
+`--verify` re-hashes each world-readable file against its recorded hash (OK /
+CHANGED), and reports files journalled without a hash as PRESENT or MISSING.
+A journal written before v1.5.1 may hold hashes of files that are not
+world-readable (earlier versions hashed anything the user could read, and
+root-only files through sudo); `--verify` now reports those NOREAD, not OK.
 
 ## Status
 
