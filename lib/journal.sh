@@ -227,7 +227,7 @@ _sha256_of() {
     done
 
     out="$(set -o pipefail
-           timeout "$t" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
+           timeout -k 2 "$t" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
                | sha256sum 2>/dev/null)" || return 1
     out="${out%% *}"
     [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1

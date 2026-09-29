@@ -155,7 +155,7 @@ file_sha256() {
         (( (8#$m & 8#1) != 0 )) || return 1
     done
     out="$(set -o pipefail
-           timeout "$HASH_TIMEOUT" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
+           timeout -k 2 "$HASH_TIMEOUT" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
                | sha256sum 2>/dev/null)" || return 1
     out="${out%% *}"
     [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1

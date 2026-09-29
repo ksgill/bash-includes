@@ -270,23 +270,19 @@ _race_fifo_after_stat() {
         local rc=0
         command stat "$@" || rc=$?
         if [[ ! -p "$_RACE_FILE" ]]; then
-            rm -f "$_RACE_FILE"
-            mkfifo -m 0644 "$_RACE_FILE"
+            if [[ "$_RACE_KIND" != firehose ]]; then
+                rm -f "$_RACE_FILE"
+                mkfifo -m 0644 "$_RACE_FILE"
+            fi
             if [[ "$_RACE_KIND" == firehose ]]; then
-                # fd 1 is the FIFO itself. Every other inherited descriptor
-                # is closed before exec: this stub runs inside journal.sh's
-                # `mapfile < <(stat …)`, and a writer that kept any pipe the
-                # shell under test later waits on (which ones are open here
-                # differs between bash versions) would hang that wait. A
-                # real FIFO writer is not our child and holds none of them.
-                (
-                    for _fd in /proc/"$BASHPID"/fd/*; do
-                        _fd=${_fd##*/}
-                        (( _fd > 2 )) && eval "exec ${_fd}>&-"
-                    done
-                    exec yes
-                ) 1<>"$_RACE_FILE" 2>/dev/null </dev/null &
-                echo $! > "${TMP}/yes.pid"
+                # The endless writer was started in the test's own shell on a
+                # side FIFO; swap that FIFO in by rename, as an attacker would.
+                # Starting it here instead, inside journal.sh's
+                # `mapfile < <(stat …)`, hangs bash 5.2: the process
+                # substitution does not finish while its background child
+                # lives. A real writer is never our child.
+                rm -f "$_RACE_FILE"
+                mv -f -- "${_RACE_FILE}.side" "$_RACE_FILE"
             fi
         fi
         return "$rc"
@@ -319,6 +315,11 @@ _race_fifo_after_stat() {
         . "$1/log.sh"; . "$1/journal.sh"
         eval "$2"
         _race_fifo_after_stat "$3" firehose
+        mkfifo -m 0644 "$3.side"
+        # Never ends; fd 1 is the side FIFO (read-write, so the open cannot
+        # block); nothing else of this shell is inherited.
+        yes 1<>"$3.side" 2>/dev/null </dev/null 3>&- 4>&- &
+        echo $! > "$TMP/yes.pid"
         _JOURNAL_HASH_TIMEOUT=2
         journal_init test v1
         journal_record modify "$3" "firehose"
@@ -350,7 +351,7 @@ _race_fifo_after_stat() {
             journal_init test v1 >/dev/null
             journal_record modify "$2" "t"
         ' _ "$LIB" "${TMP}/pub.conf" "$v"
-        grep -q '^60 dd ' "${TMP}/timeout.calls" \
+        grep -q '^-k 2 60 dd ' "${TMP}/timeout.calls" \
             || { echo "value '$v': $(cat "${TMP}/timeout.calls" 2>&1)"; false; }
     done
 }
@@ -782,7 +783,7 @@ STUB
     run env PATH="${TMP}/stub:$PATH" JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 \
         _JOURNAL_HASH_TIMEOUT=0 "${BIN}/provision-report" --verify
     [[ "$output" == *"1 ok"* ]]
-    grep -q '^60 dd ' "${TMP}/timeout.calls"
+    grep -q '^-k 2 60 dd ' "${TMP}/timeout.calls"
 }
 
 @test "provision-report escapes a UTF-8 C1 control under the C locale" {
