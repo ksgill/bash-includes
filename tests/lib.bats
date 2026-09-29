@@ -301,6 +301,7 @@ _race_fifo_after_stat() {
 }
 
 @test "journal_record cuts off a FIFO whose writer never stops" {
+    SECONDS=0
     printf 'regular\n' > "${TMP}/firehose"
     # The stub records the writer's pid under $TMP for teardown to kill.
     export TMP
@@ -313,6 +314,8 @@ _race_fifo_after_stat() {
         journal_record modify "$3" "firehose"
         echo survived
     ' _ "$LIB" "$(declare -f _race_fifo_after_stat)" "${TMP}/firehose"
+    # Printed only if the test fails: which of hang (124), signal or error.
+    echo "status=$status after ${SECONDS}s; output: $output"
     # The writer really ran, so the cut-off was exercised, not skipped.
     [ -s "${TMP}/yes.pid" ]
     kill "$(cat "${TMP}/yes.pid")" 2>/dev/null || true
