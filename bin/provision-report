@@ -39,12 +39,25 @@ Verify status:
   MISSING   file no longer exists
   NOREAD    file could not be checked (not world-readable now, or its
             existence cannot be determined)
+  SUPERSEDED  a later record in the journal is for the same path, so this
+            one no longer describes the file and is not checked
   -         nothing to check (package installs, deletions, non-path targets)
+
+Only the latest record for each path is checked. Which record is the latest
+is decided over the whole journal, whatever --run or --script select, so an
+earlier run's record of a file a later run changed or deleted shows
+SUPERSEDED, not CHANGED or MISSING.
 
 Hashes are recorded, and re-checked, only for content anyone on the machine
 can read: other-read on the file and other-execute on every ancestor
 directory. Private keys, 0600 configs and anything under a 0700 directory are
 tracked by presence alone (PRESENT / MISSING).
+
+With --verify, a record that names a backup shows whether the backup is still
+there, on its "backup:" line: [present], [missing], or [unknown] (existence
+cannot be determined, or the path is relative). Presence only; a backup's
+content is never read. This does not change the record's own status; missing
+backups are counted separately in the summary.
 HELP
 }
 
@@ -163,22 +176,30 @@ file_sha256() {
 }
 
 # ── path_state <path> ─────────────────────────────────────────────────────────
-# Print present, absent or unknown. An unprivileged `-e` answers when the path
-# is visible, or when the nearest existing ancestor is a directory we can
-# search. Behind one we cannot (a 0700 /etc/wireguard), `sudo -n test -e`
-# answers instead: it reads metadata only — never content — so it does not
-# touch the world-readable rule, and without it every root-only file the
-# journal tracks by presence would be unknowable. `-n` never prompts; a sudo
-# that cannot run leaves the answer unknown. A relative path is never judged:
-# it would be resolved against the working directory, not the machine.
+# Set PATH_STATE to present, absent or unknown. An unprivileged `-e` answers
+# when the path is visible, or when the nearest existing ancestor is a
+# directory we can search. Behind one we cannot (a 0700 /etc/wireguard), `sudo
+# -n test -e` answers instead: it reads metadata only — never content — so it
+# does not touch the world-readable rule, and without it every root-only file
+# the journal tracks by presence would be unknowable. `-n` never prompts; a
+# sudo that cannot run leaves the answer unknown. A relative path is never
+# judged: it would be resolved against the working directory, not the machine.
+#
+# Whether sudo can run without a prompt is asked once and remembered in
+# SUDO_USABLE, so a journal with many root-only paths makes one probe, not one
+# per record. That is why the answer comes back in a variable: called in a
+# command substitution, this would run in a subshell and remember nothing.
+PATH_STATE=""
+SUDO_USABLE=""
+
 path_state() {
     local f="$1" d
     if [[ "$f" != /* ]]; then
-        printf 'unknown'
+        PATH_STATE=unknown
         return 0
     fi
     if [[ -e "$f" ]]; then
-        printf 'present'
+        PATH_STATE=present
         return 0
     fi
     d="$f"
@@ -188,13 +209,41 @@ path_state() {
         d="${d:-/}"
     done
     if [[ -d "$d" && -x "$d" ]]; then
-        printf 'absent'
-    elif ! sudo -n true 2>/dev/null; then
-        printf 'unknown'
+        PATH_STATE=absent
+        return 0
+    fi
+    if [[ -z "$SUDO_USABLE" ]]; then
+        if sudo -n true 2>/dev/null; then
+            SUDO_USABLE=yes
+        else
+            SUDO_USABLE=no
+        fi
+    fi
+    if [[ "$SUDO_USABLE" != yes ]]; then
+        PATH_STATE=unknown
     elif sudo -n test -e "$f" 2>/dev/null; then
-        printf 'present'
+        PATH_STATE=present
     else
-        printf 'absent'
+        PATH_STATE=absent
+    fi
+}
+
+# ── path_key <path> ───────────────────────────────────────────────────────────
+# Set PATH_KEY to the form of an absolute path that records are matched on
+# when deciding which is the latest for a file: repeated slashes collapsed and
+# a trailing slash dropped (the root stays "/"), so /etc//x and /etc/x are one
+# target. Lexical only: symlinks are not resolved, and "." and ".." are left
+# as written, so two different spellings through a link stay two targets.
+# Matching only; display and every file check use the journalled value.
+PATH_KEY=""
+
+path_key() {
+    PATH_KEY="$1"
+    while [[ "$PATH_KEY" == *//* ]]; do
+        PATH_KEY="${PATH_KEY//\/\//\/}"
+    done
+    if [[ "$PATH_KEY" != / ]]; then
+        PATH_KEY="${PATH_KEY%/}"
     fi
 }
 
@@ -245,10 +294,38 @@ vis() {
 
 last_run=""
 total=0; ok=0; changed=0; missing=0; unreadable=0; present=0
+superseded=0; backups_missing=0
 targets_seen=()
 
+# ── Which record is the latest for each path (--verify only) ─────────────────
+# A record describes a file as it was left then. Once a later record exists
+# for the same path — a modify after a create, a delete after a backup — the
+# earlier one no longer describes anything that can be checked, and judging
+# it against the file as it is now reports drift the journal itself explains.
+# So only the latest record for a path is checked. "Latest" is over the whole
+# journal, before --run and --script are applied: a filter chooses what is
+# shown, not what happened. Only absolute paths take part; a package or unit
+# name is never checked anyway. Records are numbered by non-empty line, the
+# same count the display loop keeps.
+declare -A latest_for=()
+if [[ "$VERIFY" -eq 1 && "$RAW" -eq 0 && "$TARGETS" -eq 0 ]]; then
+    recno=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        recno=$((recno + 1))
+        # The trailing dot keeps a newline that ends the path.
+        target="$(jget "$line" target; printf .)"
+        target="${target%.}"
+        [[ "$target" == /* ]] || continue
+        path_key "$target"
+        latest_for["$PATH_KEY"]="$recno"
+    done < "$JOURNAL_FILE"
+fi
+
+recno=0
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
+    recno=$((recno + 1))
 
     run="$(jget "$line" run)"
     script="$(jget "$line" script)"
@@ -290,14 +367,31 @@ while IFS= read -r line; do
     fi
 
     status=""
+    backup_note=""
+    if [[ "$VERIFY" -eq 1 && -n "$backup" ]]; then
+        # Presence only, and it never changes the record's own status.
+        path_state "$backup"
+        case "$PATH_STATE" in
+            present) backup_note="  ${C_GRN}[present]${C_RST}" ;;
+            absent)  backup_note="  ${C_RED}[missing]${C_RST}"; backups_missing=$((backups_missing + 1)) ;;
+            *)       backup_note="  ${C_YEL}[unknown]${C_RST}" ;;
+        esac
+    fi
     if [[ "$VERIFY" -eq 1 ]]; then
         state=""
-        if [[ -z "$sha" ]]; then
+        PATH_KEY=""
+        if [[ "$target" == /* ]]; then
+            path_key "$target"
+        fi
+        if [[ -n "$PATH_KEY" && "${latest_for["$PATH_KEY"]:-$recno}" -ne "$recno" ]]; then
+            status="${C_DIM}SUPERSEDED${C_RST} "; superseded=$((superseded + 1))
+        elif [[ -z "$sha" ]]; then
             # No hash: a file that is not world-readable, a nohash record, or
             # not a file at all. A path that should still exist is checked for
             # presence; deletions and bare names have nothing to check.
             if [[ "$target" == /* && "$action" != "delete" && "$action" != "remove" ]]; then
-                state="$(path_state "$target")"
+                path_state "$target"
+                state="$PATH_STATE"
             fi
             case "$state" in
                 present) status="${C_CYN}PRESENT${C_RST} "; present=$((present + 1)) ;;
@@ -305,7 +399,7 @@ while IFS= read -r line; do
                 unknown) status="${C_YEL}NOREAD ${C_RST} "; unreadable=$((unreadable + 1)) ;;
                 *)       status="${C_DIM}   -    ${C_RST}" ;;
             esac
-        elif [[ "$(path_state "$target")" == "absent" ]]; then
+        elif path_state "$target" && [[ "$PATH_STATE" == "absent" ]]; then
             status="${C_RED}MISSING${C_RST} "; missing=$((missing + 1))
         else
             # A file that fails the world-readable rule now — or cannot be
@@ -326,7 +420,7 @@ while IFS= read -r line; do
 
     printf '  %s%s  %-8s %s\n' "$status" "$(vis "${ts:0:19}")" "$(vis "$action")" "$(vis "$target")"
     [[ -n "$detail" ]] && printf '            %s%s%s\n' "$C_DIM" "$(vis "$detail")" "$C_RST"
-    [[ -n "$backup" ]] && printf '            %sbackup: %s%s\n' "$C_DIM" "$(vis "$backup")" "$C_RST"
+    [[ -n "$backup" ]] && printf '            %sbackup: %s%s%s\n' "$C_DIM" "$(vis "$backup")" "$C_RST" "$backup_note"
 done < "$JOURNAL_FILE"
 
 if [[ "$TARGETS" -eq 1 ]]; then
@@ -335,7 +429,7 @@ fi
 
 if [[ "$RAW" -eq 0 && "$TARGETS" -eq 0 ]]; then
     printf '\n%d record(s)' "$total"
-    [[ "$VERIFY" -eq 1 ]] && printf '  —  %d ok, %d changed, %d missing, %d unreadable, %d present' \
-        "$ok" "$changed" "$missing" "$unreadable" "$present"
+    [[ "$VERIFY" -eq 1 ]] && printf '  —  %d ok, %d changed, %d missing, %d unreadable, %d present, %d superseded  —  %d backup(s) missing' \
+        "$ok" "$changed" "$missing" "$unreadable" "$present" "$superseded" "$backups_missing"
     printf '\n'
 fi

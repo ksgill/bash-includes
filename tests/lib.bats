@@ -524,9 +524,136 @@ _apt_env() {
         : > "$WGET_CALLED"
         cp "${APTKEYS}/${WGET_SERVES}" "$out"
     }
-    # shellcheck disable=SC2317
-    apt-get() { return 0; }
+    _apt_stub
 }
+
+# A stub apt-get and dpkg, for everything in apt.sh that runs them. apt-get
+# must be a real executable on PATH, not a shell function: the library goes
+# through `sudo env … apt-get`, and env execs binaries directly, so a function
+# is invisible to it. State lives under APT_STUB:
+#   calls            one line per apt-get run: LC_ALL, DEBIAN_FRONTEND, arguments
+#   sleeps           one line per sleep the library asked for (sleep is stubbed)
+#   dpkg/<pkg>       "<status> <version>": what the stubbed dpkg -l reports
+#   provided/<pkg>   install exits 0 without installing it (a provided package)
+#   version          the version install installs (default 1.0)
+#   lock-failures    N: the next N updates fail on the lists lock
+#   update-fail      every update fails, not on a lock
+#   update-stderr    every update fails, printing this file on stderr
+#   tmp-probe        each run appends the number of entries in TMPDIR to tmp-count
+#   plus-names       names ending in + that are real packages, one per line
+#   validate-fail    a scoped update (Dir::Etc::sourcelist) fails, not on a lock
+#   change-fail      install, remove and purge fail, changing nothing
+# LC_ALL and DEBIAN_FRONTEND are unset here so that what the stub logs is what
+# the library passed, not what the test environment (a CI runner) exported.
+_apt_stub() {
+    export APT_STUB="${TMP}/aptstub"
+    mkdir -p "${APT_STUB}/dpkg" "${APT_STUB}/provided" "${TMP}/bin"
+    unset LC_ALL DEBIAN_FRONTEND
+    cat > "${TMP}/bin/apt-get" <<'STUB'
+#!/usr/bin/env bash
+set -u
+printf 'LC_ALL=%s DEBIAN_FRONTEND=%s %s\n' "${LC_ALL:-unset}" "${DEBIAN_FRONTEND:-unset}" "$*" \
+    >> "${APT_STUB}/calls"
+if [[ -e "${APT_STUB}/tmp-probe" ]]; then
+    find "${TMPDIR:-/tmp}" -mindepth 1 | wc -l >> "${APT_STUB}/tmp-count"
+fi
+action="" skip=0 ended=0
+pkgs=()
+plain='^[a-z0-9][a-z0-9+.:-]*$'
+for a in "$@"; do
+    if [[ "$skip" -eq 1 ]]; then skip=0; continue; fi
+    if [[ "$ended" -eq 0 ]]; then
+        case "$a" in
+            --) ended=1; continue ;;
+            -o|-t|-c|--target-release) skip=1; continue ;;
+            -*) continue ;;
+        esac
+    fi
+    if [[ -z "$action" ]]; then action="$a"; continue; fi
+    # Like apt, only a plain name is a package to install as named: not a
+    # local file, a glob, or a <pkg>- / <pkg>+ suffix form (unless a package
+    # really has that name: plus-names lists those).
+    case "$a" in /*|./*|../*|*.deb) continue ;; esac
+    a="${a%%[=/]*}"
+    [[ "$a" =~ $plain && "$a" != *- ]] || continue
+    if [[ "$a" == *+ ]] && ! grep -qxF -- "$a" "${APT_STUB}/plus-names" 2>/dev/null; then continue; fi
+    pkgs+=("$a")
+done
+case "$action" in
+    update)
+        if [[ -f "${APT_STUB}/update-stderr" ]]; then
+            cat "${APT_STUB}/update-stderr" >&2
+            exit 100
+        fi
+        if [[ -f "${APT_STUB}/lock-failures" ]]; then
+            n="$(cat "${APT_STUB}/lock-failures")"
+            if [[ "$n" -gt 0 ]]; then
+                echo "$(( n - 1 ))" > "${APT_STUB}/lock-failures"
+                echo "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 1 (apt-get)" >&2
+                exit 100
+            fi
+        fi
+        if [[ -e "${APT_STUB}/update-fail" ]] \
+                || { [[ -e "${APT_STUB}/validate-fail" && "$*" == *Dir::Etc::sourcelist=* ]]; }; then
+            echo "E: The repository does not have a Release file." >&2
+            exit 100
+        fi
+        echo "stub update done" ;;
+    install|remove|purge)
+        if [[ -e "${APT_STUB}/change-fail" ]]; then
+            echo "E: Unable to correct problems, you have held broken packages." >&2
+            exit 100
+        fi
+        version=1.0
+        [[ -f "${APT_STUB}/version" ]] && version="$(cat "${APT_STUB}/version")"
+        for p in ${pkgs[@]+"${pkgs[@]}"}; do
+            case "$action" in
+                install)
+                    [[ -e "${APT_STUB}/provided/${p}" ]] \
+                        || echo "ii ${version}" > "${APT_STUB}/dpkg/${p}" ;;
+                remove)
+                    if [[ -f "${APT_STUB}/dpkg/${p}" ]]; then
+                        echo "rc ${version}" > "${APT_STUB}/dpkg/${p}"
+                    fi ;;
+                purge)
+                    rm -f "${APT_STUB}/dpkg/${p}" ;;
+            esac
+        done ;;
+esac
+exit 0
+STUB
+    chmod +x "${TMP}/bin/apt-get"
+    PATH="${TMP}/bin:${PATH}"
+
+    # shellcheck disable=SC2317
+    sleep() { printf 'sleep %s\n' "$*" >> "${APT_STUB}/sleeps"; }
+    # The shape of `dpkg -l <pkg>`: header lines, then status, name, version.
+    # shellcheck disable=SC2317
+    dpkg() {
+        local st ver listed
+        [[ "${1:-}" == -l && -f "${APT_STUB}/dpkg/${2:-}" ]] || return 1
+        read -r st ver listed < "${APT_STUB}/dpkg/$2"
+        printf '%s\n' 'Desired=Unknown/Install/Remove/Purge/Hold' '||/ Name  Version  Architecture  Description'
+        printf '%s  %s  %s  all  stub package\n' "$st" "${listed:-$2}" "$ver"
+    }
+}
+
+# _pkg_is <package> <status> [version] [listed-as] — set what the stubbed dpkg
+# reports when asked for <package>. dpkg lists a package with or without an
+# architecture qualifier whichever form it was asked for; [listed-as] is the
+# name in its listing when that differs from the name asked for.
+_pkg_is() {
+    echo "$2 ${3:-1.0} ${4:-}" > "${APT_STUB}/dpkg/$1"
+}
+
+# _verify — provision-report --verify over the test journal.
+_verify() {
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify
+}
+
+# _calls — the apt-get runs so far, one per line; _journal — the records.
+_calls() { cat "${APT_STUB}/calls" 2>/dev/null || true; }
+_journal() { cat "$JOURNAL_FILE" 2>/dev/null || true; }
 
 _add() {
     apt_add_repo "$@" fixture 'https://example.invalid/key' 'https://example.invalid/repo' stable
@@ -672,10 +799,850 @@ STUB
     [[ "$output" != *delta* ]]
 }
 
+@test "apt_install_list reads a last line that has no trailing newline" {
+    printf 'alpha\nbeta' > "${TMP}/pkgs.list"
+    mkdir -p "${TMP}/bin"
+    cat > "${TMP}/bin/apt-get" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@"
+STUB
+    chmod +x "${TMP}/bin/apt-get"
+    PATH="${TMP}/bin:${PATH}"
+
+    run apt_install_list "${TMP}/pkgs.list"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"2 packages"* ]]
+    [[ "$output" == *beta* ]]
+}
+
 @test "apt_install_list fails loudly on a missing manifest" {
     run apt_install_list "${TMP}/nope.list"
     [ "$status" -ne 0 ]
     [[ "$output" == *"Package list not found"* ]]
+}
+
+@test "apt_install_list waits for the dpkg lock and journals one record per package it installed" {
+    _apt_stub
+    journal_init "test" "v1"
+    _pkg_is alpha ii
+    printf '%s\n' alpha beta gamma > "${TMP}/pkgs.list"
+    run apt_install_list "${TMP}/pkgs.list"
+    [ "$status" -eq 0 ]
+    [ "$(_calls | grep -c 'DPkg::Lock::Timeout=1200')" -eq 1 ]
+    [ "$(_journal | wc -l)" -eq 2 ]
+    [ "$(_journal | grep -c '"action":"install","target":"beta","detail":"package list pkgs.list ')" -eq 1 ]
+    [ "$(_journal | grep -c '"action":"install","target":"gamma"')" -eq 1 ]
+}
+
+# ── apt locks ─────────────────────────────────────────────────────────────────
+# On a freshly booted host another apt process usually holds one of apt's two
+# locks. Installs, removes and purges pass apt's own dpkg-lock timeout; updates
+# go through apt_update_wait, which retries on the lists lock.
+
+@test "APT_LOCK_WAIT and APT_LOCK_RETRY default to 1200 and 10" {
+    [ "$APT_LOCK_WAIT" -eq 1200 ]
+    [ "$APT_LOCK_RETRY" -eq 10 ]
+}
+
+@test "APT_LOCK_WAIT and APT_LOCK_RETRY set before sourcing are kept" {
+    run bash -c 'APT_LOCK_WAIT=60; APT_LOCK_RETRY=2; . "$1/log.sh"; . "$1/apt.sh"; echo "${APT_LOCK_WAIT} ${APT_LOCK_RETRY}"' _ "$LIB"
+    [ "$status" -eq 0 ]
+    [ "$output" = "60 2" ]
+}
+
+@test "apt_lock_wait_message names the wait in minutes" {
+    APT_LOCK_WAIT=600
+    run apt_lock_wait_message
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"up to 10 minutes"* ]]
+    [ "${#lines[@]}" -eq 1 ]
+}
+
+@test "apt_update_wait retries while apt reports the lists lock, says so once, then succeeds" {
+    _apt_stub
+    echo 2 > "${APT_STUB}/lock-failures"
+    run apt_update_wait -qq
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 3 ]
+    [ "$(_calls | grep -c '^LC_ALL=C DEBIAN_FRONTEND=unset update -qq$')" -eq 3 ]
+    [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 2 ]
+    [ "$(grep -c 'holds the package lists lock' <<< "$output")" -eq 1 ]
+    [[ "$output" == *"[INFO]"*"holds the package lists lock"* ]]
+    [[ "$output" == *"stub update done"* ]]
+    # The lock errors of the attempts that were retried are not shown.
+    [[ "$output" != *"Could not get lock"* ]]
+}
+
+@test "apt_update_wait returns a failure that is not a lock at once, with apt's status" {
+    _apt_stub
+    : > "${APT_STUB}/update-fail"
+    run apt_update_wait
+    [ "$status" -eq 100 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    [ ! -e "${APT_STUB}/sleeps" ]
+    [[ "$output" == *"does not have a Release file"* ]]
+    [[ "$output" != *"holds the package lists lock"* ]]
+}
+
+@test "apt_update_wait gives up after APT_LOCK_WAIT seconds of waiting, with apt's status" {
+    _apt_stub
+    echo 99 > "${APT_STUB}/lock-failures"
+    APT_LOCK_WAIT=30
+    APT_LOCK_RETRY=10
+    run apt_update_wait
+    [ "$status" -eq 100 ]
+    [ "$(_calls | wc -l)" -eq 4 ]
+    [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 3 ]
+    [ "$(grep -c 'holds the package lists lock' <<< "$output")" -eq 1 ]
+    [ "$(grep -c 'Could not get lock' <<< "$output")" -eq 1 ]
+}
+
+@test "apt_update_wait sends the waiting line to APT_WAIT_NOTICE_FD when set" {
+    _apt_stub
+    echo 1 > "${APT_STUB}/lock-failures"
+    local out
+    { out="$(APT_WAIT_NOTICE_FD=4 apt_update_wait 2>&1)"; } 4> "${TMP}/notice"
+    grep -q 'holds the package lists lock' "${TMP}/notice"
+    [[ "$out" != *"holds the package lists lock"* ]]
+    [[ "$out" == *"stub update done"* ]]
+}
+
+@test "apt_update_wait does not take the phrase in the middle of a line for a lock" {
+    _apt_stub
+    echo 'E: Failed to fetch https://example.invalid/InRelease  Could not get lock on the mirror' > "${APT_STUB}/update-stderr"
+    run apt_update_wait
+    [ "$status" -eq 100 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    [ ! -e "${APT_STUB}/sleeps" ]
+    [[ "$output" != *"holds the package lists lock"* ]]
+    [[ "$output" == *"Failed to fetch"* ]]
+}
+
+@test "apt_update_wait retries on apt's lock line whichever path it names" {
+    _apt_stub
+    APT_LOCK_WAIT=10
+    printf '%s\n' 'E: Could not get lock /var/lib/apt/lists/ - open (11: Resource temporarily unavailable)' \
+        'E: Unable to lock directory /var/lib/apt/lists/' > "${APT_STUB}/update-stderr"
+    run apt_update_wait
+    [ "$status" -eq 100 ]
+    [ "$(_calls | wc -l)" -eq 2 ]
+    [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 1 ]
+}
+
+@test "apt_update_wait does not retry when apt may not open the lock" {
+    _apt_stub
+    printf '%s\n' 'E: Could not open lock file /var/lib/apt/lists/lock - open (13: Permission denied)' \
+        'E: Unable to lock directory /var/lib/apt/lists/' > "${APT_STUB}/update-stderr"
+    run apt_update_wait
+    [ "$status" -eq 100 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    [ ! -e "${APT_STUB}/sleeps" ]
+}
+
+@test "apt_update_wait leaves no temporary file, during the update or after it" {
+    _apt_stub
+    export TMPDIR="${TMP}/tmpdir"
+    mkdir -p "$TMPDIR"
+    : > "${APT_STUB}/tmp-probe"
+    echo 1 > "${APT_STUB}/lock-failures"
+    run apt_update_wait
+    [ "$status" -eq 0 ]
+    # Nothing there while apt-get ran (an interrupt then leaves nothing)…
+    [ "$(sort -u "${APT_STUB}/tmp-count" | tr -d ' ')" = "0" ]
+    [ "$(wc -l < "${APT_STUB}/tmp-count")" -eq 2 ]
+    # …and nothing after, on the failed path either.
+    : > "${APT_STUB}/update-fail"
+    run apt_update_wait
+    [ "$status" -eq 100 ]
+    [ "$(find "$TMPDIR" -mindepth 1 | wc -l)" -eq 0 ]
+}
+
+@test "APT_LOCK_RETRY=0 falls back to 10 with one warning instead of spinning" {
+    _apt_stub
+    echo 99 > "${APT_STUB}/lock-failures"
+    _twice() { APT_LOCK_WAIT=20; APT_LOCK_RETRY=0; apt_update_wait; echo "first: $?"; apt_update_wait; echo "second: $?"; }
+    run _twice
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"first: 100"* ]]
+    [[ "$output" == *"second: 100"* ]]
+    [ "$(grep -c "APT_LOCK_RETRY='0' is not a positive number" <<< "$output")" -eq 1 ]
+    # Two calls, each one attempt plus two retries ten seconds apart.
+    [ "$(_calls | wc -l)" -eq 6 ]
+    [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 4 ]
+    [ "$(wc -l < "${APT_STUB}/sleeps")" -eq 4 ]
+}
+
+@test "a non-numeric APT_LOCK_WAIT falls back to 1200 with a warning and never reaches apt or arithmetic" {
+    _apt_stub
+    # An array subscript in arithmetic would run the command substitution.
+    APT_LOCK_WAIT="x[\$(touch ${TMP}/pwned)]"
+    run apt_install alpha
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "is not a number of seconds; using 1200" <<< "$output")" -eq 1 ]
+    _calls | grep -q ' install -y -o DPkg::Lock::Timeout=1200 alpha$'
+    run apt_lock_wait_message
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"up to 20 minutes"* ]]
+    echo 1 > "${APT_STUB}/lock-failures"
+    run apt_update_wait
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"up to 20 minutes"* ]]
+    [ ! -e "${TMP}/pwned" ]
+}
+
+@test "apt_update_wait survives an APT_WAIT_NOTICE_FD that is not open, or not a number" {
+    _apt_stub
+    _strict() { set -euo pipefail; APT_WAIT_NOTICE_FD="$1" apt_update_wait; echo "returned $?"; }
+    echo 1 > "${APT_STUB}/lock-failures"
+    run _strict 97
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"returned 0"* ]]
+    [ "$(grep -c 'holds the package lists lock' <<< "$output")" -eq 1 ]
+    echo 1 > "${APT_STUB}/lock-failures"
+    run _strict '2; echo injected'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"returned 0"* ]]
+    [ "$(grep -c 'holds the package lists lock' <<< "$output")" -eq 1 ]
+    [[ "$output" != *injected* ]]
+}
+
+@test "apt_install passes the dpkg lock timeout, non-interactively" {
+    _apt_stub
+    run apt_install alpha
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    _calls | grep -q '^LC_ALL=unset DEBIAN_FRONTEND=noninteractive install -y -o DPkg::Lock::Timeout=1200 alpha$'
+}
+
+@test "apt_remove passes the dpkg lock timeout, non-interactively" {
+    _apt_stub
+    _pkg_is alpha ii
+    APT_LOCK_WAIT=300
+    run apt_remove alpha
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    _calls | grep -q '^LC_ALL=unset DEBIAN_FRONTEND=noninteractive remove -y -o DPkg::Lock::Timeout=300 alpha$'
+}
+
+@test "apt_purge passes the dpkg lock timeout, non-interactively" {
+    _apt_stub
+    _pkg_is alpha ii
+    run apt_purge alpha
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    _calls | grep -q '^LC_ALL=unset DEBIAN_FRONTEND=noninteractive purge -y -o DPkg::Lock::Timeout=1200 alpha$'
+}
+
+# ── apt_change and its wrappers: journal only what changed ────────────────────
+# apt-get exits 0 for a package it leaves alone, so "apt succeeded" is not
+# "this was installed". The journal follows dpkg's state before and after.
+
+@test "apt_pkg_state prints status and version, and nothing for an unknown package" {
+    _apt_stub
+    _pkg_is alpha ii 2.4-1
+    run apt_pkg_state alpha
+    [ "$status" -eq 0 ]
+    [ "$output" = "ii 2.4-1" ]
+    run apt_pkg_state nosuch
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "apt_pkg_state matches a name with or without the architecture qualifier on either side" {
+    _apt_stub
+    # Asked for with a qualifier, listed without one.
+    _pkg_is alpha:amd64 ii 1.1 alpha
+    run apt_pkg_state alpha:amd64
+    [ "$status" -eq 0 ]
+    [ "$output" = "ii 1.1" ]
+    # Asked for without a qualifier, listed with one.
+    _pkg_is beta ii 1.2 beta:amd64
+    run apt_pkg_state beta
+    [ "$status" -eq 0 ]
+    [ "$output" = "ii 1.2" ]
+    # Both qualified and the same.
+    _pkg_is gamma:arm64 ii 1.3 gamma:arm64
+    run apt_pkg_state gamma:arm64
+    [ "$output" = "ii 1.3" ]
+    # Two different architectures are not the same package.
+    _pkg_is delta:arm64 ii 1.4 delta:amd64
+    run apt_pkg_state delta:arm64
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    # A longer name that merely starts with the one asked for is not a match.
+    _pkg_is eps ii 1.5 epsilon
+    run apt_pkg_state eps
+    [ -z "$output" ]
+}
+
+@test "apt_install sees a package asked for with an architecture that dpkg lists without one as installed" {
+    _apt_stub
+    journal_init "test" "v1"
+    : > "${APT_STUB}/provided/alpha:amd64"
+    _pkg_is alpha:amd64 ii 1.0 alpha
+    run apt_install alpha:amd64
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"did not install"* ]]
+    [ "$(_journal | wc -l)" -eq 0 ]
+}
+
+@test "apt_install journals nothing for a package that is already installed" {
+    _apt_stub
+    journal_init "test" "v1"
+    _pkg_is alpha ii
+    run apt_install alpha
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+    [ "$(_journal | wc -l)" -eq 0 ]
+    [[ "$output" != *"[WARN]"* ]]
+}
+
+@test "apt_install journals one record, with both states, for each package it installed" {
+    _apt_stub
+    journal_init "test" "v1"
+    _pkg_is alpha ii
+    run apt_install alpha beta
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' alpha beta$'
+    [ "$(_journal | wc -l)" -eq 1 ]
+    [ "$(_journal | grep -c '"action":"install","target":"beta"')" -eq 1 ]
+    _journal | grep -qF '(dpkg: not known -> ii 1.0)'
+    _journal | grep -qF '"operation":"install","before":"not known","after":"ii 1.0"'
+}
+
+@test "apt_install journals an upgrade: the version changed" {
+    _apt_stub
+    journal_init "test" "v1"
+    _pkg_is alpha ii 0.9
+    run apt_install alpha
+    [ "$status" -eq 0 ]
+    [ "$(_journal | wc -l)" -eq 1 ]
+    _journal | grep -qF '"before":"ii 0.9","after":"ii 1.0"'
+}
+
+@test "apt_install warns about a provided package and does not record or die" {
+    _apt_stub
+    journal_init "test" "v1"
+    : > "${APT_STUB}/provided/virtualpkg"
+    run apt_install virtualpkg beta
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[WARN]"*"did not install 'virtualpkg'"* ]]
+    [[ "$output" != *"did not install 'beta'"* ]]
+    [ "$(_journal | wc -l)" -eq 1 ]
+    [ "$(_journal | grep -c '"target":"virtualpkg"')" -eq 0 ]
+    [ "$(_journal | grep -c '"target":"beta"')" -eq 1 ]
+}
+
+@test "apt_install passes the options before -- to apt-get, and tracks a versioned package by name" {
+    _apt_stub
+    journal_init "test" "v1"
+    run apt_install --no-install-recommends --allow-downgrades -- alpha=1.0 beta
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' install -y -o DPkg::Lock::Timeout=1200 --no-install-recommends --allow-downgrades -- alpha=1.0 beta$'
+    [ "$(_journal | wc -l)" -eq 2 ]
+    [ "$(_journal | grep -c '"action":"install","target":"alpha"')" -eq 1 ]
+    [ "$(_journal | grep -c '"action":"install","target":"beta"')" -eq 1 ]
+}
+
+@test "apt_install --reason sets the journal detail and is not passed to apt-get" {
+    _apt_stub
+    journal_init "test" "v1"
+    run apt_install --reason "needed by the widget" alpha
+    [ "$status" -eq 0 ]
+    [ "$(_calls | grep -c 'reason\|widget')" -eq 0 ]
+    _calls | grep -q ' alpha$'
+    _journal | grep -qF '"target":"alpha","detail":"needed by the widget (dpkg: not known -> ii 1.0)"'
+
+    run apt_install --no-install-recommends --reason="second form" -- beta
+    [ "$status" -eq 0 ]
+    [ "$(_calls | grep -c 'reason\|second')" -eq 0 ]
+    _calls | grep -q ' --no-install-recommends -- beta$'
+    _journal | grep -qF '"target":"beta","detail":"second form (dpkg: not known -> ii 1.0)"'
+}
+
+@test "apt_install passes the caller's -- on to apt-get, and not when the caller gave none" {
+    _apt_stub
+    run apt_install -- alpha
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' install -y -o DPkg::Lock::Timeout=1200 -- alpha$'
+    run apt_remove --reason "gone" -- alpha
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' remove -y -o DPkg::Lock::Timeout=1200 -- alpha$'
+    run apt_purge -- alpha
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' purge -y -o DPkg::Lock::Timeout=1200 -- alpha$'
+    # The form without a -- is passed as it always was.
+    run apt_install beta
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' install -y -o DPkg::Lock::Timeout=1200 beta$'
+}
+
+@test "apt_install_list refuses a line that is not a package name, and runs nothing" {
+    _apt_stub
+    printf '%s\n' '# tools' alpha '-oFoo::Bar=1' beta > "${TMP}/pkgs.list"
+    run apt_install_list "${TMP}/pkgs.list"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"${TMP}/pkgs.list: line 3 is not one package name: '-oFoo::Bar=1'"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_install_list refuses two names on one line, naming the line as written" {
+    _apt_stub
+    printf '%s\n' alpha '  foo bar  # two of them' beta > "${TMP}/pkgs.list"
+    run apt_install_list "${TMP}/pkgs.list"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"${TMP}/pkgs.list: line 2 is not one package name: '  foo bar  # two of them'"* ]]
+    [[ "$output" != *foobar* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_install_list refuses a removal suffix, a glob, a path and an upper-case name" {
+    _apt_stub
+    local bad
+    for bad in 'beta-' 'beta-=1.0' 'lib*' 'lib?' 'lib[ab]' './local.deb' '/tmp/x.deb' 'Alpha' 'alpha=1.0*' 'alpha/' 'alpha:'; do
+        printf '%s\n' alpha "$bad" > "${TMP}/pkgs.list"
+        run apt_install_list "${TMP}/pkgs.list"
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"line 2 is not one package name: '${bad}'"* ]]
+    done
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_install_list accepts a name with an architecture, a version or a release" {
+    _apt_stub
+    printf '%s\n' 'alpha:amd64' ' beta=1:2.0-1~rc1+b2 ' 'gamma/some-backports  # pinned' 'g++' 'lib2.0-x' > "${TMP}/pkgs.list"
+    run apt_install_list "${TMP}/pkgs.list"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"5 packages"* ]]
+    _calls | grep -qF ' -- alpha:amd64 beta=1:2.0-1~rc1+b2 gamma/some-backports g++ lib2.0-x'
+}
+
+@test "apt_install_list passes its packages to apt-get after a --" {
+    _apt_stub
+    printf '%s\n' alpha beta > "${TMP}/pkgs.list"
+    run apt_install_list "${TMP}/pkgs.list"
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' install -y -o DPkg::Lock::Timeout=1200 -- alpha beta$'
+}
+
+@test "apt_change refuses --reason with no value before the --" {
+    _apt_stub
+    run apt_change install --reason -- alpha
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--reason needs a value"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+    run apt_change install --reason
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--reason needs a value"* ]]
+}
+
+@test "apt_change refuses a bare word before the --: a misplaced package" {
+    _apt_stub
+    run apt_change install --no-install-recommends alpha -- beta
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"'alpha' is before the -- but is not an option"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+    # An option outside the four known to take a separate value needs it attached.
+    run apt_change install --solver internal -- beta
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"'internal' is before the -- but is not an option"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_change takes the separate value of -t, -o, -c and --target-release with its option" {
+    _apt_stub
+    journal_init "test" "v1"
+    run apt_change install -t backports -o Foo::Bar=1 -c "${TMP}/apt.conf" --target-release other --solver=internal -- alpha
+    [ "$status" -eq 0 ]
+    _calls | grep -qF " -t backports -o Foo::Bar=1 -c ${TMP}/apt.conf --target-release other --solver=internal -- alpha"
+    [ "$(_journal | wc -l)" -eq 1 ]
+    [ "$(_journal | grep -c '"action":"install","target":"alpha"')" -eq 1 ]
+    # One of them with nothing after it but the -- has no value.
+    run apt_change install -t -- alpha
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"-t needs a value"* ]]
+}
+
+@test "apt_install passes a local .deb, a glob and the - and + suffix forms untracked and unwarned" {
+    _apt_stub
+    journal_init "test" "v1"
+    run apt_install -- ./local.deb "${TMP}/other.deb" 'lib*' beta- gamma+ alpha
+    [ "$status" -eq 0 ]
+    _calls | grep -qF " -- ./local.deb ${TMP}/other.deb lib* beta- gamma+ alpha"
+    [[ "$output" != *"did not install"* ]]
+    [ "$(_journal | wc -l)" -eq 1 ]
+    [ "$(_journal | grep -c '"action":"install","target":"alpha"')" -eq 1 ]
+}
+
+@test "apt_install tracks a package whose name really ends in +" {
+    _apt_stub
+    journal_init "test" "v1"
+    echo 'g++' > "${APT_STUB}/plus-names"
+    run apt_install 'g++'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"did not install"* ]]
+    [ "$(_journal | grep -c '"action":"install","target":"g++"')" -eq 1 ]
+}
+
+@test "apt_install still tracks <name>/<release> by name" {
+    _apt_stub
+    journal_init "test" "v1"
+    run apt_install alpha/backports
+    [ "$status" -eq 0 ]
+    [ "$(_journal | grep -c '"action":"install","target":"alpha"')" -eq 1 ]
+}
+
+@test "apt_install with no packages runs nothing" {
+    _apt_stub
+    run apt_install
+    [ "$status" -eq 0 ]
+    run apt_install --reason "nothing to do" --
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_change returns apt-get's status; apt_install, apt_remove and apt_purge die" {
+    _apt_stub
+    journal_init "test" "v1"
+    : > "${APT_STUB}/change-fail"
+    _after_change() { apt_change "$@" || echo "returned $?"; echo "still running"; }
+    run _after_change install alpha
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"returned 100"* ]]
+    [[ "$output" == *"still running"* ]]
+
+    _after_wrapper() { "$@"; echo "still running"; }
+    run _after_wrapper apt_install alpha
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Failed to install: alpha"* ]]
+    [[ "$output" != *"still running"* ]]
+    run _after_wrapper apt_remove alpha
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Failed to remove: alpha"* ]]
+    run _after_wrapper apt_purge alpha
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Failed to purge: alpha"* ]]
+    [ "$(_journal | wc -l)" -eq 0 ]
+}
+
+@test "apt_change refuses an unknown action without running apt-get" {
+    _apt_stub
+    run apt_change upgrade alpha
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unknown action 'upgrade'"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_remove journals a removal, and nothing for a package that was not installed" {
+    _apt_stub
+    journal_init "test" "v1"
+    _pkg_is alpha ii
+    run apt_remove --reason "replaced" -- alpha beta
+    [ "$status" -eq 0 ]
+    [ "$(_journal | wc -l)" -eq 1 ]
+    _journal | grep -qF '"action":"remove","target":"alpha","detail":"remove: replaced (dpkg: ii 1.0 -> rc 1.0)"'
+    _journal | grep -qF '"operation":"remove","before":"ii 1.0","after":"rc 1.0"'
+}
+
+@test "apt_purge journals a purge with both states" {
+    _apt_stub
+    journal_init "test" "v1"
+    _pkg_is alpha rc
+    run apt_purge alpha
+    [ "$status" -eq 0 ]
+    [ "$(_journal | wc -l)" -eq 1 ]
+    _journal | grep -qF '"action":"remove","target":"alpha","detail":"purge: apt-get purge (dpkg: rc 1.0 -> not known)"'
+    _journal | grep -qF '"operation":"purge","before":"rc 1.0","after":"not known"'
+}
+
+# ── apt_add_repo / apt_remove_repo: backups and the journal ───────────────────
+# A sources file that was there before the call is backed up before it is
+# replaced or removed. One the call wrote itself is never backed up: that
+# would overwrite an older backup with a file nobody has seen.
+
+@test "apt_add_repo backs up a sources file it reconfigures and journals the backup path" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    sed -i 's/^Suites: .*/Suites: old/' "${APT_SOURCES_DIR}/fixture.sources"
+    journal_init "test" "v1"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    grep -qxF 'Suites: stable' "${APT_SOURCES_DIR}/fixture.sources"
+    grep -qxF 'Suites: old' "${APT_SOURCES_DIR}/fixture.sources.bak"
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 1 ]
+    _journal | grep '"action":"repo"' | grep -qF "\"backup\":\"${APT_SOURCES_DIR}/fixture.sources.bak\""
+    _journal | grep '"action":"repo"' | grep -qF 'reconfigured APT repo fixture'
+}
+
+@test "apt_add_repo journals a new sources file without a backup" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 1 ]
+    [ "$(_journal | grep -c '"backup"')" -eq 0 ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources.bak" ]
+    # Validation and the refresh both went through apt_update_wait.
+    [ "$(_calls | wc -l)" -eq 2 ]
+    [ "$(_calls | grep -c '^LC_ALL=C DEBIAN_FRONTEND=unset update')" -eq 2 ]
+}
+
+@test "apt_add_repo does nothing at all for a repo that is already configured" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    journal_init "test" "v1"
+    : > "${APT_STUB}/calls"
+    rm -f "$WGET_CALLED"
+    # A write would replace the content or at least move the mtime.
+    touch -d '2001-01-01 00:00:00' "${APT_SOURCES_DIR}/fixture.sources" "${APT_KEYRING_DIR}/fixture.gpg"
+    local before
+    before="$(stat -c '%Y %s %i' "${APT_SOURCES_DIR}/fixture.sources" "${APT_KEYRING_DIR}/fixture.gpg")"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already configured"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+    [ ! -e "$WGET_CALLED" ]
+    [ "$(stat -c '%Y %s %i' "${APT_SOURCES_DIR}/fixture.sources" "${APT_KEYRING_DIR}/fixture.gpg")" = "$before" ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources.bak" ]
+    [ "$(_journal | wc -l)" -eq 0 ]
+}
+
+@test "apt_add_repo records a validated repo even when the full update after it fails, and a re-run is a no-op" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    # The scoped validation passes; the full update after it does not.
+    cat > "${TMP}/bin/apt-get.real" < "${TMP}/bin/apt-get"
+    cat > "${TMP}/bin/apt-get" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" != *Dir::Etc::sourcelist=* ]]; then : > "${APT_STUB}/update-fail"; fi
+exec bash "$(dirname "$0")/apt-get.real" "$@"
+STUB
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+    [ "$(_calls | wc -l)" -eq 2 ]
+    [[ "$output" == *"[WARN]"*"passed validation, but the full apt-get update after it failed"* ]]
+    [[ "$output" == *"does not have a Release file"* ]]
+    # The file is valid and stays, so it is recorded.
+    [ -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 1 ]
+    _verify
+    [[ "$output" != *MISSING* ]]
+    # A re-run finds it configured and recorded, and does nothing more.
+    rm -f "${APT_STUB}/update-fail"
+    mv "${TMP}/bin/apt-get.real" "${TMP}/bin/apt-get"
+    : > "${APT_STUB}/calls"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already configured"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 1 ]
+}
+
+@test "apt_add_repo and apt_remove_repo refuse a name that is not one plain file name" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    mkdir -p "${TMP}/keyrings"
+    echo 'not ours' > "${TMP}/x.sources"
+    echo 'not ours' > "${TMP}/x.gpg"
+    local bad
+    for bad in '../x' '-x' 'a/b' '.hidden' 'a b'; do
+        run apt_add_repo --fingerprint "$FPR_A" -- "$bad" 'https://example.invalid/key' 'https://example.invalid/repo' stable
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"apt_add_repo: '${bad}' is not a usable repo name"* ]]
+        run apt_remove_repo -- "$bad"
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"apt_remove_repo: '${bad}' is not a usable repo name"* ]]
+    done
+    [ ! -e "$WGET_CALLED" ]
+    [ "$(_calls | wc -l)" -eq 0 ]
+    [ "$(_journal | wc -l)" -eq 0 ]
+    [ "$(cat "${TMP}/x.sources")" = 'not ours' ]
+    [ "$(cat "${TMP}/x.gpg")" = 'not ours' ]
+    [ ! -e "${TMP}/x.sources.bak" ]
+}
+
+@test "apt_add_repo: a failed validation removes the file it created, journals nothing for it and leaves an earlier .bak alone" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    echo 'from an earlier run' > "${APT_SOURCES_DIR}/fixture.sources.bak"
+    : > "${APT_STUB}/validate-fail"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"failed validation"* ]]
+    [[ "$output" == *"does not have a Release file"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(cat "${APT_SOURCES_DIR}/fixture.sources.bak")" = 'from an earlier run' ]
+    # Created and removed in one call: no change, so no record. The keyring
+    # was installed and stays, and that is the only record.
+    [ "$(_journal | grep -c 'fixture.sources')" -eq 0 ]
+    [ "$(_journal | wc -l)" -eq 1 ]
+    [ "$(_journal | grep -c "\"action\":\"create\",\"target\":\"${APT_KEYRING_DIR}/fixture.gpg\"")" -eq 1 ]
+    # Nothing in the journal names a file that is no longer there.
+    _verify
+    [ "$status" -eq 0 ]
+    [[ "$output" != *MISSING* ]]
+    [[ "$output" != *CHANGED* ]]
+}
+
+@test "apt_add_repo: a failed validation after reconfiguring keeps the .bak of the version before the call" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    sed -i 's/^Suites: .*/Suites: old/' "${APT_SOURCES_DIR}/fixture.sources"
+    journal_init "test" "v1"
+    : > "${APT_STUB}/validate-fail"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    grep -qxF 'Suites: old' "${APT_SOURCES_DIR}/fixture.sources.bak"
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 0 ]
+    [ "$(_journal | grep -c '"action":"backup"')" -eq 1 ]
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 1 ]
+    _journal | grep '"action":"delete"' | grep -qF 'the version before this call is the backup'
+    _journal | grep '"action":"delete"' | grep -qF "\"backup\":\"${APT_SOURCES_DIR}/fixture.sources.bak\""
+    # The call's own record does not name a missing file as one to check.
+    # (backup_file's `backup` record for the same path is not asserted on.)
+    _verify
+    [ "$status" -eq 0 ]
+    [ "$(grep -c ' delete ' <<< "$output")" -eq 1 ]
+    [ "$(grep ' delete ' <<< "$output" | grep -c 'MISSING')" -eq 0 ]
+    # The action column is padded; "APT repo fixture" in a detail is not.
+    [ "$(grep -c '  repo  ' <<< "$output")" -eq 0 ]
+}
+
+@test "apt_add_repo: a lock held for the whole wait is reported as not validated, not as a repo that does not publish" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    echo 99 > "${APT_STUB}/lock-failures"
+    APT_LOCK_WAIT=10
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"[WARN]"*"was not validated: another apt process held the package lists lock for the whole wait"* ]]
+    [[ "$output" != *"does not publish"* ]]
+    [[ "$output" != *"failed validation"* ]]
+    [[ "$output" == *"E: Could not get lock"* ]]
+    # The previous state is restored: a file this call created is removed.
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(_journal | grep -c 'fixture.sources')" -eq 0 ]
+    # One attempt and one retry; no refresh to sit through the same wait again.
+    [ "$(_calls | wc -l)" -eq 2 ]
+}
+
+@test "apt_add_repo: a lock held for the whole wait after a reconfigure keeps the .bak and journals why" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    sed -i 's/^Suites: .*/Suites: old/' "${APT_SOURCES_DIR}/fixture.sources"
+    journal_init "test" "v1"
+    echo 99 > "${APT_STUB}/lock-failures"
+    APT_LOCK_WAIT=10
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"does not publish"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    grep -qxF 'Suites: old' "${APT_SOURCES_DIR}/fixture.sources.bak"
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 1 ]
+    _journal | grep '"action":"delete"' | grep -qF 'which could not be validated (the package lists lock was held for the whole wait)'
+    _journal | grep '"action":"delete"' | grep -qF "\"backup\":\"${APT_SOURCES_DIR}/fixture.sources.bak\""
+}
+
+@test "apt_add_repo waits for the lists lock during validation and still shows the waiting line" {
+    _apt_env; WGET_SERVES=a.asc
+    echo 1 > "${APT_STUB}/lock-failures"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(grep -c 'holds the package lists lock' <<< "$output")" -eq 1 ]
+    [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 1 ]
+}
+
+@test "apt_remove_repo backs up the sources file and the keyring, and journals both removals" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    journal_init "test" "v1"
+    : > "${APT_STUB}/calls"
+    run apt_remove_repo fixture
+    [ "$status" -eq 0 ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+    grep -qxF 'Suites: stable' "${APT_SOURCES_DIR}/fixture.sources.bak"
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg.bak"
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 2 ]
+    _journal | grep -qF "\"action\":\"delete\",\"target\":\"${APT_SOURCES_DIR}/fixture.sources\",\"detail\":\"removed APT repo fixture\",\"backup\":\"${APT_SOURCES_DIR}/fixture.sources.bak\""
+    _journal | grep -F '"action":"delete"' | grep -F "\"target\":\"${APT_KEYRING_DIR}/fixture.gpg\"" | grep -qF "\"backup\":\"${APT_KEYRING_DIR}/fixture.gpg.bak\""
+    [ "$(_calls | grep -c '^LC_ALL=C DEBIAN_FRONTEND=unset update -qq$')" -eq 1 ]
+}
+
+@test "apt_remove_repo --keep-key removes the sources file and leaves the keyring" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    journal_init "test" "v1"
+    : > "${APT_STUB}/calls"
+    run apt_remove_repo --keep-key fixture
+    [ "$status" -eq 0 ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    grep -qxF 'Suites: stable' "${APT_SOURCES_DIR}/fixture.sources.bak"
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg.bak" ]
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 1 ]
+    [ "$(_journal | grep -c 'fixture.gpg')" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 1 ]
+}
+
+@test "apt_remove_repo removes a keyring left behind without its sources file, with a backup" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    rm -f "${APT_SOURCES_DIR}/fixture.sources"
+    journal_init "test" "v1"
+    : > "${APT_STUB}/calls"
+    run apt_remove_repo fixture
+    [ "$status" -eq 0 ]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg.bak"
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 1 ]
+    _journal | grep -F '"action":"delete"' | grep -F "\"target\":\"${APT_KEYRING_DIR}/fixture.gpg\"" | grep -qF "\"backup\":\"${APT_KEYRING_DIR}/fixture.gpg.bak\""
+    # No sources file went away, so there is nothing for apt to forget.
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_remove_repo --keep-key leaves a keyring without a sources file alone" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    rm -f "${APT_SOURCES_DIR}/fixture.sources"
+    journal_init "test" "v1"
+    run apt_remove_repo --keep-key fixture
+    [ "$status" -eq 0 ]
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+    [ "$(_journal | wc -l)" -eq 0 ]
+}
+
+@test "apt_remove_repo refuses a missing name and an unknown option" {
+    _apt_env
+    run apt_remove_repo
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"apt_remove_repo: name is required"* ]]
+    run apt_remove_repo --keep-key
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"apt_remove_repo: name is required"* ]]
+    run apt_remove_repo --purge fixture
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"unknown option '--purge'"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_remove_repo does nothing when the repo is not configured" {
+    _apt_env
+    journal_init "test" "v1"
+    run apt_remove_repo fixture
+    [ "$status" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 0 ]
+    [ "$(_journal | wc -l)" -eq 0 ]
 }
 
 # ── provision-report field extraction ─────────────────────────────────────────
@@ -879,12 +1846,226 @@ STUB
     [ "$status" -eq 0 ]
     [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 1 present"* ]]
     run ! grep -qv '^true$\|^test -e ' "${TMP}/sudo.calls"
+    # Whether sudo can run is asked once for the whole journal, not per path.
+    [ "$(grep -c '^true$' "${TMP}/sudo.calls")" -eq 1 ]
+    [ "$(grep -c '^test -e ' "${TMP}/sudo.calls")" -eq 2 ]
 
     # Without a working sudo the answer is unknown, never MISSING.
     run env PATH="${TMP}/stub:$PATH" TMP="$TMP" SUDO_BROKEN=1 JOURNAL_FILE="$JOURNAL_FILE" \
         NO_COLOR=1 "${BIN}/provision-report" --verify
     chmod 0700 "${TMP}/rootonly"
     [[ "$output" == *"0 ok, 0 changed, 0 missing, 2 unreadable, 0 present"* ]]
+}
+
+# ── provision-report --verify: superseded records and backups ─────────────────
+# Only the latest record for a path describes the file as it should be now.
+# An earlier one is SUPERSEDED, not judged against a file a later record
+# changed or removed. _row <action> prints the report's line(s) for records
+# with that action under ${TMP}.
+
+_row() { grep -E "  $1 +${TMP}/" <<< "$output" || true; }
+
+@test "provision-report --verify: a backup followed by a delete is SUPERSEDED, and nothing is MISSING" {
+    journal_init "reporter" "v9"
+    printf 'x\n' > "${TMP}/gone.conf"
+    backup_file "${TMP}/gone.conf" "removing it"
+    rm -f "${TMP}/gone.conf"
+    journal_record delete "${TMP}/gone.conf" "removed" "backup=${TMP}/gone.conf.bak"
+
+    _verify
+    [ "$status" -eq 0 ]
+    [[ "$(_row backup)" == *SUPERSEDED* ]]
+    [[ "$(_row delete)" == "     -    "* ]]
+    [[ "$output" != *MISSING* ]]
+    [[ "$output" == *"2 record(s)"*"0 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+}
+
+@test "provision-report --verify: a create followed by a journalled modify is SUPERSEDED, then OK" {
+    journal_init "reporter" "v9"
+    printf 'one\n' > "${TMP}/two.conf"
+    journal_record create "${TMP}/two.conf" "written"
+    printf 'two\n' > "${TMP}/two.conf"
+    journal_record modify "${TMP}/two.conf" "rewritten"
+
+    _verify
+    [[ "$(_row create)" == *SUPERSEDED* ]]
+    [[ "$(_row modify)" == *" OK "* ]]
+    [[ "$output" != *CHANGED* ]]
+    [[ "$output" == *"1 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+}
+
+@test "provision-report --verify: a delete followed by a re-create is SUPERSEDED, and the create is checked" {
+    journal_init "reporter" "v9"
+    journal_record delete "${TMP}/back.conf" "removed"
+    printf 'again\n' > "${TMP}/back.conf"
+    journal_record create "${TMP}/back.conf" "written again"
+
+    _verify
+    [[ "$(_row delete)" == *SUPERSEDED* ]]
+    [[ "$(_row create)" == *" OK "* ]]
+    rm -f "${TMP}/back.conf"
+    _verify
+    [[ "$(_row delete)" == *SUPERSEDED* ]]
+    [[ "$(_row create)" == *MISSING* ]]
+    [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+}
+
+@test "provision-report --verify --run: an earlier run's record is SUPERSEDED by a later run that is not shown" {
+    journal_init "first" "v1"
+    local first="$_JOURNAL_RUN_ID"
+    printf 'one\n' > "${TMP}/runs.conf"
+    journal_record create "${TMP}/runs.conf" "written"
+    journal_init "second" "v1"
+    printf 'two\n' > "${TMP}/runs.conf"
+    journal_record modify "${TMP}/runs.conf" "rewritten"
+
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify --run "$first"
+    [ "$status" -eq 0 ]
+    [[ "$(_row create)" == *SUPERSEDED* ]]
+    [ -z "$(_row modify)" ]
+    [[ "$output" != *CHANGED* ]]
+    [[ "$output" == *"1 record(s)"*"0 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --verify --script first
+    [[ "$(_row create)" == *SUPERSEDED* ]]
+}
+
+@test "provision-report --verify: real drift on the latest record is still CHANGED or MISSING" {
+    journal_init "reporter" "v9"
+    printf 'one\n' > "${TMP}/drift2.conf"
+    journal_record create "${TMP}/drift2.conf" "written"
+    printf 'two\n' > "${TMP}/drift2.conf"
+    journal_record modify "${TMP}/drift2.conf" "rewritten"
+    printf 'three\n' > "${TMP}/drift2.conf"
+
+    _verify
+    [[ "$(_row create)" == *SUPERSEDED* ]]
+    [[ "$(_row modify)" == *CHANGED* ]]
+    [[ "$output" == *"0 ok, 1 changed, 0 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+
+    rm -f "${TMP}/drift2.conf"
+    _verify
+    [[ "$(_row create)" == *SUPERSEDED* ]]
+    [[ "$(_row modify)" == *MISSING* ]]
+    [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+}
+
+@test "provision-report --verify: a path with a space and a newline is superseded like any other" {
+    journal_init "reporter" "v9"
+    local odd="${TMP}/odd name"$'\n'"x.conf"
+    printf 'one\n' > "$odd"
+    journal_record create "$odd" "written"
+    printf 'two\n' > "$odd"
+    journal_record modify "$odd" "rewritten"
+    # A different path that only shares the first line is not the same target.
+    printf 'other\n' > "${TMP}/odd name"
+    journal_record create "${TMP}/odd name" "another file"
+
+    _verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"2 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 1 superseded"* ]]
+    [ "$(grep -c 'SUPERSEDED' <<< "$output")" -eq 1 ]
+    [[ "$(grep 'SUPERSEDED' <<< "$output")" == *" create "* ]]
+}
+
+@test "provision-report --verify: repeated and trailing slashes do not make a path a different target" {
+    journal_init "reporter" "v9"
+    mkdir -p "${TMP}/sl"
+    printf 'one\n' > "${TMP}/sl/n.conf"
+    journal_record create "${TMP}//sl///n.conf" "written"
+    printf 'two\n' > "${TMP}/sl/n.conf"
+    journal_record modify "${TMP}/sl/n.conf" "rewritten"
+    journal_record create "${TMP}/sl/" "made the directory"
+    journal_record modify "${TMP}/sl" "changed its mode"
+
+    _verify
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'SUPERSEDED' <<< "$output")" -eq 2 ]
+    [[ "$(_row create)" != *" OK "* ]]
+    # The journalled spelling is what is shown.
+    [[ "$output" == *"create   ${TMP}//sl///n.conf"* ]]
+    [[ "$output" == *"create   ${TMP}/sl/"* ]]
+    [[ "$output" == *"1 ok, 0 changed, 0 missing, 0 unreadable, 1 present, 2 superseded"* ]]
+}
+
+@test "provision-report --verify: package and other non-path targets are never SUPERSEDED" {
+    journal_init "reporter" "v9"
+    journal_record install some-package "installed"
+    journal_record remove some-package "removed"
+    journal_record install some-package "installed again"
+
+    _verify
+    [[ "$output" != *SUPERSEDED* ]]
+    [[ "$output" == *"3 record(s)"*"0 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 0 superseded"* ]]
+}
+
+@test "provision-report --verify shows whether a record's backup is present, missing or unknown" {
+    journal_init "reporter" "v9"
+    printf 'now\n' > "${TMP}/kept.conf"
+    printf 'then\n' > "${TMP}/kept.conf.bak"
+    journal_record modify "${TMP}/kept.conf" "edited" "backup=${TMP}/kept.conf.bak"
+
+    _verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"backup: ${TMP}/kept.conf.bak  [present]"* ]]
+    [[ "$output" == *"1 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 0 superseded  —  0 backup(s) missing"* ]]
+
+    # A missing backup is counted on its own; the record itself is still OK.
+    rm -f "${TMP}/kept.conf.bak"
+    _verify
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"backup: ${TMP}/kept.conf.bak  [missing]"* ]]
+    [[ "$(_row modify)" == *" OK "* ]]
+    [[ "$output" != *MISSING* ]]
+    [[ "$output" == *"1 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 0 superseded  —  1 backup(s) missing"* ]]
+}
+
+@test "provision-report --verify calls a relative backup path unknown, and checks a superseded record's backup too" {
+    journal_init "reporter" "v9"
+    printf 'now\n' > "${TMP}/rel.conf"
+    journal_record modify "${TMP}/rel.conf" "edited" "backup=rel.conf.bak"
+    journal_record modify "${TMP}/rel.conf" "edited again" "backup=${TMP}/rel.conf.gone"
+    journal_record modify "${TMP}/rel.conf" "and again"
+    # A file of that name in the working directory must not be consulted.
+    printf 'decoy\n' > "${TMP}/rel.conf.bak"
+
+    run bash -c 'cd "$1" && JOURNAL_FILE="$2" NO_COLOR=1 "$3/provision-report" --verify' _ "$TMP" "$JOURNAL_FILE" "$BIN"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"backup: rel.conf.bak  [unknown]"* ]]
+    [[ "$output" == *"backup: ${TMP}/rel.conf.gone  [missing]"* ]]
+    [[ "$output" == *"1 ok, 0 changed, 0 missing, 0 unreadable, 0 present, 2 superseded  —  1 backup(s) missing"* ]]
+}
+
+@test "provision-report without --verify prints exactly what it always has" {
+    mkdir -p "$JOURNAL_DIR"
+    printf '%s\n' \
+        '{"ts":"2026-01-02T03:04:05Z","run":"abcd1234","script":"s","version":"v1","host":"h","user":"u","action":"modify","target":"/etc/example.conf","detail":"a detail","backup":"/etc/example.conf.bak"}' \
+        '{"ts":"2026-01-02T03:04:06Z","run":"abcd1234","script":"s","version":"v1","host":"h","user":"u","action":"delete","target":"/etc/example.conf","detail":"gone"}' \
+        '{"ts":"2026-01-02T03:04:07Z","run":"ef567890","script":"t","version":"v2","host":"h","user":"u","action":"install","target":"some-package","detail":""}' \
+        > "$JOURNAL_FILE"
+    local expected
+    expected="$(printf '%s\n' \
+        '● run abcd1234  s  v1' \
+        '  2026-01-02T03:04:05  modify   /etc/example.conf' \
+        '            a detail' \
+        '            backup: /etc/example.conf.bak' \
+        '  2026-01-02T03:04:06  delete   /etc/example.conf' \
+        '            gone' \
+        '' \
+        '● run ef567890  t  v2' \
+        '  2026-01-02T03:04:07  install  some-package' \
+        '' \
+        '3 record(s)')"
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$expected" ]
+}
+
+@test "provision-report --help describes SUPERSEDED and the backup check" {
+    run "${BIN}/provision-report" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *SUPERSEDED* ]]
+    [[ "$output" == *"[missing]"* ]]
 }
 
 # ── cleanup stack ─────────────────────────────────────────────────────────────
