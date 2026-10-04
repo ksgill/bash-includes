@@ -47,6 +47,30 @@ in the header comment.
 **Backups follow `.orig` / `.bak`.** `.orig` captures the pristine
 package-shipped version, written at most once. `.bak` captures the previous
 state for everything else and is overwritten each run. See `lib/backup.sh`.
+`backup_file` also backs up a file the invoking user cannot see. When the
+file is in a root-owned directory that user may not search (0750, 0700), it
+asks root, through `sudo`, whether the file and an existing `.orig` are
+there, instead of taking "not visible" for "not there" and letting the file
+be replaced with no backup. Exactly what that covers:
+
+- A file that is visible, or visibly absent (its nearest existing ancestor
+  can be searched), costs no sudo call for the test.
+- A symlink is judged by its target: a visible link into a directory only
+  root can search is put to root; a dangling link in plain sight is absent.
+- Root is asked only about a directory root owns (a symlinked directory is
+  judged by what it points to). One that another user owns and has closed is
+  left alone: the file is treated as absent, with a warning.
+- A relative path is never put to root; it is absent as soon as the invoking
+  user cannot tell.
+- If root's answer is needed and sudo gives none, `backup_file` dies rather
+  than let the caller modify a file that got no backup.
+
+A symlink is backed up as the file it points to: the backup is a copy of the
+content with the target's mode, owner and timestamps, not a second link to
+the same target. The copy is written at the backup's own path or not at all:
+a file or link already there is replaced, never written through, and if that
+path is a directory the copy fails and `backup_file` dies rather than place
+the backup inside it.
 
 **Persistent changes are journalled** to `/var/lib/provision/changes.jsonl` —
 state, not logs, so it survives log rotation. Run transcripts go to
@@ -75,6 +99,68 @@ on every call. To choose a fingerprint, take the publisher's, then confirm the
 key actually signs the repository: `gpgv --keyring <key.gpg>
 dists/<suite>/InRelease`.
 
+`apt_repo_keyring_pinned <name> <FPR>[,<FPR>...]` answers "is the keyring
+installed for this repo one of these pinned keys?" without changing anything:
+0 when `<name>.gpg` exists and holds only primary keys from the list, 1 when
+it is missing, unreadable or holds any other key, 2 for a bad name or list.
+It is the check `apt_add_repo` makes of an existing keyring, and reads the
+keyring through `sudo`, so one the invoking user cannot read is still checked.
+
+`apt_add_repo` tells its failures apart, so a caller can fall back to the
+distribution's packages in the one case where that is sound:
+
+| Status | Meaning | Left behind |
+|---|---|---|
+| 0 | configured and validated, or already configured | the keyring and sources file |
+| 1 | the repository does not serve this suite: apt's scoped update reported `E: The repository '…' does not have a Release file.` (or `no longer has`), the server's answer for that file was 404 (or it is a `file:` repository), and there was no signature or connection problem | the sources file is removed; after a reconfigure the earlier version is its backup; the pinned keyring stays |
+| 2 | anything else | see below |
+
+Status 2 covers:
+
+- a call that is wrong as written (arguments, name, fingerprint options).
+  Fatal: the shell exits 2;
+- a key that could not be fetched, is not the pinned one, or could not be
+  installed. No keyring is left;
+- an unpinned existing keyring that could not be moved aside. It is still in
+  place;
+- a sources file that could not be backed up (untouched), written (possibly
+  incomplete; the earlier version is the backup) or removed (still in place,
+  unvalidated);
+- a scoped validation that did not succeed for any reason other than the
+  suite not being served. The sources file is removed as for status 1, since
+  an unvalidated source is never left configured:
+  - the repository's signature could not be verified against the pinned key
+    (signed by another key, expired, not signed, or no longer signed). The
+    validation forces `Acquire::AllowInsecureRepositories` and
+    `Acquire::AllowDowngradeToInsecureRepositories` off, so a host configured
+    to accept unsigned repositories cannot make one validate; if apt still
+    only warns that there is no Release file, that is status 2 as well;
+  - the repository could not be reached: the name does not resolve, the
+    connection failed, the server refused access (401, 403), or it answered
+    for the Release file with any HTTP status other than 404; the message
+    names the status. The validation runs with `APT::Update::Error-Mode=any`,
+    so apt reports a transient failure as a failure instead of exiting 0 with
+    a warning;
+  - the lists lock was held for the whole wait;
+  - apt failed in a way the function does not recognise;
+- a full update that failed after a successful validation. The repository
+  stays configured and recorded.
+
+Only status 1 says the repository itself is unsuitable. A publisher's key
+rotation is always status 2, whichever way it shows up: the key URL serving a
+key that is not the pinned one, or the repository signed by a new key while
+the keyring holds the old one.
+
+```bash
+rc=0
+apt_add_repo --fingerprint "$FPR" example "$KEY_URL" "$REPO_URL" "$SUITE" || rc=$?
+case "$rc" in
+    0) ;;
+    1) log_warn "no packages for ${SUITE} upstream; using the distribution's" ;;
+    *) die "could not set up the example repository" ;;
+esac
+```
+
 **apt waits for its locks** (since v1.6.0). On a freshly booted host another
 apt process (unattended-upgrades, apt-daily) usually holds one of apt's two
 locks for minutes, and an `apt-get` that finds a lock taken fails at once.
@@ -91,8 +177,10 @@ Everything in `lib/apt.sh` waits instead:
 
 `APT_LOCK_WAIT` defaults to 1200 (20 minutes) and `APT_LOCK_RETRY` to 10; set
 either before sourcing the library to change it. `APT_LOCK_WAIT` must be a
-whole number of seconds and `APT_LOCK_RETRY` a positive one; anything else is
-replaced by the default, with a warning. `apt_lock_wait_message`
+whole number of seconds from 0 to 999999 and `APT_LOCK_RETRY` one from 1 to
+9999, in decimal with no leading zero; anything else is replaced by the
+default, with a warning, when the library is sourced and again wherever the
+values are used. `apt_lock_wait_message`
 prints a sentence describing the wait, for a script to log before its first
 apt call: `log_info "$(apt_lock_wait_message)"`. A caller that captures
 `apt_update_wait`'s output sets `APT_WAIT_NOTICE_FD` to a descriptor of its
@@ -175,18 +263,18 @@ name is letters, digits, `.`, `_` and `-`, starting with a letter or digit;
 `apt_add_repo` backs up a sources file it reconfigures. The `repo` journal
 record is written once the scoped validation has succeeded, and carries the
 backup path after a reconfigure; if the full update after it then fails, the
-call warns and returns 1 with the repo configured and recorded, and a re-run
-finds nothing to do. If the validation could not run because the package
-lists lock was held for the whole of `APT_LOCK_WAIT`, the file is removed in
-the same way as a failed validation, but the warning says the repository was
-not validated rather than that it does not publish. If the new file fails
-validation
-it is removed; the file the call wrote is not backed up, so the backup of the
-version before the call (or an older backup, when the call created the file)
-is left intact. A file created and removed in the same call is not journalled;
-a reconfigured one is journalled as a single `delete` record with the backup
-path. A repository that is already configured as requested is left alone: no
-update, no write, no record.
+call warns and returns 2 with the repo configured and recorded, and a re-run
+finds nothing to do.
+
+Whenever the scoped validation does not succeed, the new sources file is
+removed, and the status says why (1 for a suite the repository does not
+serve, 2 for a signature, connection or lock failure; see the table above).
+The file the call wrote is not backed up, so the backup of the version before
+the call (or an older backup, when the call created the file) is left intact.
+A file created and removed in the same call is not journalled; a reconfigured
+one is journalled as a single `delete` record with the backup path and the
+reason. A repository that is already configured as requested is left alone:
+no update, no write, no record.
 
 `apt_remove_repo [--keep-key] <name>` backs up the sources file and the
 keyring before removing them and journals each removal with its backup path.
@@ -297,6 +385,22 @@ What a script that used v1.5.x can notice:
   `<name>.gpg.bak`), journals each removal, removes a keyring left behind
   without its sources file, and takes `--keep-key` to leave the keyring.
 - **Repo names are validated** by `apt_add_repo` and `apt_remove_repo`.
+- **`apt_add_repo` statuses.** It returned 1 for every failure; now 1 means
+  only that the repository does not serve the suite (apt found no Release
+  file for it), and every other failure is 2 (a wrong call exits 2 where it
+  exited 1). A repository whose signature does not verify against the pinned
+  key, or that cannot be reached, is 2 and is removed; before, an unreachable
+  one passed validation. `apt_add_repo … || die` is unaffected; a caller that
+  fell back to the distribution's packages on any non-zero status should now
+  do so on 1 only.
+- **`apt_repo_keyring_pinned <name> <FPR>[,<FPR>...]`** is new: whether the
+  keyring installed for a repo holds only pinned keys.
+- **`backup_file` sees root-only files.** A file in a root-owned directory the
+  invoking user cannot search is now backed up; before, it was taken for
+  absent and skipped. An existing `.orig` there is found too, and not
+  overwritten. If root has to be asked and sudo gives no answer, it dies.
+- **`backup_file` and symlinks.** The backup of a symlink is now a copy of the
+  file it points to; before, it was another link to the same target.
 - **`apt.sh` no longer includes `os.sh`.** A script that calls `get_os_codename`
   or the like must include `os.sh` itself.
 - **Delete your own copies.** A script that defines its own `apt_update_wait`,

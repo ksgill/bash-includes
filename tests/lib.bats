@@ -68,6 +68,14 @@ teardown() {
     if [[ -f "${TMP}/yes.pid" ]]; then
         kill "$(cat "${TMP}/yes.pid")" 2>/dev/null || true
     fi
+    # Some tests lock a directory (mode 0000); a failed one leaves it locked.
+    # Directories only, found without following links: a test may leave a
+    # symlink that points out of the tree, and nothing out there is touched.
+    # Repeated, because a locked directory hides the ones inside it.
+    local pass
+    for pass in 1 2 3 4; do
+        find -P "${TMP}" -type d ! -perm -u+rwx -exec chmod u+rwx {} + 2>/dev/null || true
+    done
     rm -rf "${TMP}"
 }
 
@@ -483,6 +491,249 @@ _race_fifo_after_stat() {
     grep -q "\"backup\":\"${TMP}/j.conf.bak\"" "$JOURNAL_FILE"
 }
 
+# A directory the invoking user may not search, and a stand-in for root that
+# can: it opens the directory for the one command it runs, and logs it. The
+# directory is the test user's own, so it is also presented as root's, which
+# is what makes backup_file ask; _locked_dir_own leaves the real owner.
+_locked_dir() {
+    _locked_dir_own
+    # shellcheck disable=SC2317
+    _backup_dir_owner() { echo 0; }
+}
+
+# What the privileged existence question looks like in sudo.calls.
+_asked_root() { grep -cF " sh $1 $2" "${TMP}/sudo.calls" 2>/dev/null || true; }
+
+_locked_dir_own() {
+    mkdir "${TMP}/locked"
+    # shellcheck disable=SC2317
+    sudo() {
+        case "${1:-}" in -v|-n) shift ;; esac
+        [[ $# -eq 0 ]] && return 0
+        printf '%s\n' "$*" >> "${TMP}/sudo.calls"
+        local rc=0
+        chmod 0700 "${TMP}/locked"
+        "$@" || rc=$?
+        chmod 0000 "${TMP}/locked"
+        return "$rc"
+    }
+}
+
+@test "backup_file backs up a file in a directory the invoking user cannot search" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    journal_init "test" "v1"
+    _locked_dir
+    printf 'root only\n' > "${TMP}/locked/secret.conf"
+    chmod 0000 "${TMP}/locked"
+    # Invisible to an unprivileged test, exactly as a missing file is.
+    [ ! -f "${TMP}/locked/secret.conf" ]
+
+    run backup_file "${TMP}/locked/secret.conf" "replacing it"
+    chmod 0700 "${TMP}/locked"
+    [ "$status" -eq 0 ]
+    [ "$(cat "${TMP}/locked/secret.conf.bak")" = "root only" ]
+    [ ! -e "${TMP}/locked/secret.conf.orig" ]
+    grep -q "\"action\":\"backup\",\"target\":\"${TMP}/locked/secret.conf\"" "$JOURNAL_FILE"
+    grep -q "\"backup\":\"${TMP}/locked/secret.conf.bak\"" "$JOURNAL_FILE"
+    [ "$(_asked_root -f "${TMP}/locked/secret.conf")" -eq 1 ]
+}
+
+@test "backup_file still does nothing for a file that is absent from such a directory" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    journal_init "test" "v1"
+    _locked_dir
+    chmod 0000 "${TMP}/locked"
+    run backup_file "${TMP}/locked/nothing.conf"
+    chmod 0700 "${TMP}/locked"
+    [ "$status" -eq 0 ]
+    [ ! -e "${TMP}/locked/nothing.conf.bak" ]
+    [ ! -e "${TMP}/locked/nothing.conf.orig" ]
+    [ "$(wc -l < "$JOURNAL_FILE")" -eq 0 ]
+    # Root was asked, and said no: this is not the unprivileged guess.
+    [ "$(_asked_root -f "${TMP}/locked/nothing.conf")" -eq 1 ]
+    [[ "$output" != *"Cannot check"* ]]
+}
+
+@test "backup_file dies when root cannot be asked about a file only root can see" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    journal_init "test" "v1"
+    _locked_dir
+    printf 'root only\n' > "${TMP}/locked/secret.conf"
+    chmod 0000 "${TMP}/locked"
+    # A sudo that runs nothing: no timestamp, no terminal to prompt on.
+    # shellcheck disable=SC2317
+    sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.calls"; return 1; }
+    _then() { backup_file "$@"; echo "went on to modify it"; }
+    run _then "${TMP}/locked/secret.conf"
+    chmod 0700 "${TMP}/locked"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not find out whether ${TMP}/locked/secret.conf exists"* ]]
+    [[ "$output" != *"went on to modify it"* ]]
+    [ ! -e "${TMP}/locked/secret.conf.bak" ]
+}
+
+@test "backup_file does not ask root about a directory that someone else has closed" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    journal_init "test" "v1"
+    # The real owner: the test user, not root.
+    _locked_dir_own
+    printf 'not root territory\n' > "${TMP}/locked/secret.conf"
+    chmod 0000 "${TMP}/locked"
+    run backup_file "${TMP}/locked/secret.conf"
+    chmod 0700 "${TMP}/locked"
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "Cannot check ${TMP}/locked/secret.conf for a backup" <<< "$output")" -eq 1 ]
+    [ ! -e "${TMP}/locked/secret.conf.bak" ]
+    [ ! -e "${TMP}/sudo.calls" ]
+    [ "$(wc -l < "$JOURNAL_FILE")" -eq 0 ]
+}
+
+@test "backup_file answers for a relative path in a working directory that cannot be searched, without looping" {
+    [[ "$EUID" -eq 0 ]] && skip "root can search anywhere"
+    mkdir "${TMP}/cwd"
+    printf 'x\n' > "${TMP}/cwd/rel.conf"
+    # shellcheck disable=SC2016
+    run timeout 20 bash -c '
+        . "$1/log.sh"; . "$1/journal.sh"; . "$1/backup.sh"
+        sudo() { echo "asked root: $*"; "$@"; }
+        cd "$2/cwd" && chmod 0000 "$2/cwd" || exit 9
+        backup_file rel.conf
+        echo "returned $?"
+        backup_file sub/dir/rel.conf
+        echo "returned $?"
+    ' _ "$LIB" "$TMP"
+    chmod 0700 "${TMP}/cwd"
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^returned 0$' <<< "$output")" -eq 2 ]
+    [[ "$output" != *"asked root"* ]]
+    [ ! -e "${TMP}/cwd/rel.conf.bak" ]
+}
+
+@test "backup_file backs up through a symlink whose target is in a directory only root can search" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    journal_init "test" "v1"
+    _locked_dir
+    printf 'behind the link\n' > "${TMP}/locked/real.conf"
+    ln -s "${TMP}/locked/real.conf" "${TMP}/link.conf"
+    ln -s "${TMP}/nowhere/at-all.conf" "${TMP}/dangling.conf"
+    chmod 0000 "${TMP}/locked"
+
+    run backup_file "${TMP}/link.conf"
+    [ "$status" -eq 0 ]
+    [ "$(_asked_root -f "${TMP}/link.conf")" -eq 1 ]
+    [ ! -L "${TMP}/link.conf.bak" ]
+    [ "$(cat "${TMP}/link.conf.bak")" = "behind the link" ]
+    # A dangling link in plain sight is absent, and root is not asked.
+    run backup_file "${TMP}/dangling.conf"
+    chmod 0700 "${TMP}/locked"
+    [ "$status" -eq 0 ]
+    [ ! -e "${TMP}/dangling.conf.bak" ]
+    [ "$(_asked_root -f "${TMP}/dangling.conf")" -eq 0 ]
+}
+
+@test "backup_file copies what a symlink points to, not the link" {
+    journal_init "test" "v1"
+    printf 'the content\n' > "${TMP}/real.conf"
+    chmod 0640 "${TMP}/real.conf"
+    ln -s real.conf "${TMP}/link.conf"
+    backup_file "${TMP}/link.conf"
+    [ ! -L "${TMP}/link.conf.bak" ]
+    [ -f "${TMP}/link.conf.bak" ]
+    [ "$(stat -c %a "${TMP}/link.conf.bak")" = "640" ]
+    # The point of a backup: it does not change when the original does.
+    printf 'changed\n' > "${TMP}/real.conf"
+    [ "$(cat "${TMP}/link.conf.bak")" = "the content" ]
+    [ -L "${TMP}/link.conf" ]
+}
+
+@test "backup_file never writes the backup inside a directory that a .bak link points to" {
+    journal_init "test" "v1"
+    printf 'current\n' > "${TMP}/real.conf"
+    mkdir "${TMP}/somewhere"
+    ln -s somewhere "${TMP}/real.conf.bak"
+    _then() { backup_file "$@"; echo "went on"; }
+    run _then "${TMP}/real.conf"
+    # Nothing landed in the directory, whichever way cp took the link.
+    [ "$(find "${TMP}/somewhere" -mindepth 1 | wc -l)" -eq 0 ]
+    if [[ "$status" -eq 0 ]]; then
+        # Replaced (GNU cp): the backup is at its own path.
+        [ ! -L "${TMP}/real.conf.bak" ]
+        [ "$(cat "${TMP}/real.conf.bak")" = "current" ]
+    else
+        # Refused: then backup_file died, and the caller did not go on.
+        [[ "$output" == *"Could not back up ${TMP}/real.conf"* ]]
+        [[ "$output" != *"went on"* ]]
+    fi
+}
+
+@test "backup_file dies rather than copy into a directory that is where the .bak goes" {
+    journal_init "test" "v1"
+    printf 'current\n' > "${TMP}/real.conf"
+    mkdir "${TMP}/real.conf.bak"
+    _then() { backup_file "$@"; echo "went on"; }
+    run _then "${TMP}/real.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not back up ${TMP}/real.conf"* ]]
+    [[ "$output" != *"went on"* ]]
+    [ "$(find "${TMP}/real.conf.bak" -mindepth 1 | wc -l)" -eq 0 ]
+}
+
+@test "the owner of an unsearchable ancestor is that of the directory a link points to" {
+    [[ "$EUID" -eq 0 ]] && skip "root owns everything it makes"
+    # A link the test user owns, to a directory root owns.
+    ln -s / "${TMP}/to-root"
+    [ "$(stat -c %u "${TMP}/to-root")" = "$(id -u)" ]
+    run _backup_dir_owner "${TMP}/to-root"
+    # Gone before anything can walk the tree.
+    rm -f "${TMP}/to-root"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+    run _backup_dir_owner "${TMP}/no-such-dir"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "backup_file replaces a .bak that is itself a link instead of writing through it" {
+    journal_init "test" "v1"
+    printf 'current\n' > "${TMP}/real.conf"
+    printf 'unrelated\n' > "${TMP}/elsewhere"
+    ln -s elsewhere "${TMP}/real.conf.bak"
+    backup_file "${TMP}/real.conf"
+    [ ! -L "${TMP}/real.conf.bak" ]
+    [ "$(cat "${TMP}/real.conf.bak")" = "current" ]
+    [ "$(cat "${TMP}/elsewhere")" = "unrelated" ]
+}
+
+@test "backup_file never overwrites a .orig it cannot see" {
+    [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
+    journal_init "test" "v1"
+    _locked_dir
+    printf 'as shipped\n' > "${TMP}/locked/app.conf"
+    printf 'the first pristine copy\n' > "${TMP}/locked/app.conf.orig"
+    # The packaging system shipped exactly the current content: pristine.
+    printf 'as shipped\n' > "${TMP}/shipped"
+    _maintainer_md5() { md5sum < "${TMP}/shipped" | cut -d' ' -f1; }
+    chmod 0000 "${TMP}/locked"
+
+    run backup_file "${TMP}/locked/app.conf"
+    chmod 0700 "${TMP}/locked"
+    [ "$status" -eq 0 ]
+    [ "$(cat "${TMP}/locked/app.conf.orig")" = "the first pristine copy" ]
+    [ "$(cat "${TMP}/locked/app.conf.bak")" = "as shipped" ]
+}
+
+@test "backup_file asks sudo nothing about a file it can see, or can see is absent" {
+    journal_init "test" "v1"
+    _locked_dir
+    printf 'x\n' > "${TMP}/seen.conf"
+    backup_file "${TMP}/seen.conf"
+    backup_file "${TMP}/not-there.conf"
+    backup_file "${TMP}/no-such-dir/deeper/not-there.conf"
+    [ -f "${TMP}/seen.conf.bak" ]
+    [ "$(grep -c '^sh -c' "${TMP}/sudo.calls")" -eq 0 ]
+    [ "$(grep -c '^cp ' "${TMP}/sudo.calls")" -eq 1 ]
+}
+
 # ── apt_add_repo: signing-key fingerprints ────────────────────────────────────
 # Since v1.5.0 a caller must pin the signing key (--fingerprint) or say
 # explicitly that it will not (--no-fingerprint). Both a downloaded key and an
@@ -541,7 +792,10 @@ _apt_env() {
 #   update-stderr    every update fails, printing this file on stderr
 #   tmp-probe        each run appends the number of entries in TMPDIR to tmp-count
 #   plus-names       names ending in + that are real packages, one per line
-#   validate-fail    a scoped update (Dir::Etc::sourcelist) fails, not on a lock
+#   validate-fail    a scoped update (Dir::Etc::sourcelist) fails as apt does
+#                    for a suite the repository does not serve
+#   validate-output  a scoped update prints this file on stderr and exits
+#                    with the status in validate-exit (default 100)
 #   change-fail      install, remove and purge fail, changing nothing
 # LC_ALL and DEBIAN_FRONTEND are unset here so that what the stub logs is what
 # the library passed, not what the test environment (a CI runner) exported.
@@ -595,8 +849,16 @@ case "$action" in
         fi
         if [[ -e "${APT_STUB}/update-fail" ]] \
                 || { [[ -e "${APT_STUB}/validate-fail" && "$*" == *Dir::Etc::sourcelist=* ]]; }; then
-            echo "E: The repository does not have a Release file." >&2
+            # As apt prints it: the fetch on stdout, the error on stderr.
+            echo "Ign:1 https://example.invalid/repo stable InRelease"
+            echo "Err:2 https://example.invalid/repo stable Release"
+            echo "  404  Not Found"
+            echo "E: The repository 'https://example.invalid/repo stable Release' does not have a Release file." >&2
             exit 100
+        fi
+        if [[ -f "${APT_STUB}/validate-output" && "$*" == *Dir::Etc::sourcelist=* ]]; then
+            cat "${APT_STUB}/validate-output" >&2
+            exit "$(cat "${APT_STUB}/validate-exit" 2>/dev/null || echo 100)"
         fi
         echo "stub update done" ;;
     install|remove|purge)
@@ -978,7 +1240,7 @@ STUB
     APT_LOCK_WAIT="x[\$(touch ${TMP}/pwned)]"
     run apt_install alpha
     [ "$status" -eq 0 ]
-    [ "$(grep -c "is not a number of seconds; using 1200" <<< "$output")" -eq 1 ]
+    [ "$(grep -c "is not a number of seconds" <<< "$output")" -eq 1 ]
     _calls | grep -q ' install -y -o DPkg::Lock::Timeout=1200 alpha$'
     run apt_lock_wait_message
     [ "$status" -eq 0 ]
@@ -988,6 +1250,61 @@ STUB
     [ "$status" -eq 0 ]
     [[ "$output" == *"up to 20 minutes"* ]]
     [ ! -e "${TMP}/pwned" ]
+}
+
+@test "APT_LOCK_WAIT=08 and APT_LOCK_RETRY=08 fall back instead of breaking arithmetic as octal" {
+    _apt_stub
+    APT_LOCK_WAIT=08
+    run apt_lock_wait_message
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "APT_LOCK_WAIT='08' is not a number of seconds" <<< "$output")" -eq 1 ]
+    [[ "$output" == *"up to 20 minutes"* ]]
+    [[ "$output" != *"value too great for base"* ]]
+
+    APT_LOCK_WAIT=1200
+    APT_LOCK_RETRY=08
+    echo 1 > "${APT_STUB}/lock-failures"
+    run apt_update_wait
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "APT_LOCK_RETRY='08' is not a positive number" <<< "$output")" -eq 1 ]
+    [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 1 ]
+    [[ "$output" != *"value too great for base"* ]]
+
+    # Out of range is refused too.
+    APT_LOCK_RETRY=10
+    APT_LOCK_WAIT=1000000
+    run apt_install alpha
+    [ "$status" -eq 0 ]
+    _calls | grep -q ' -o DPkg::Lock::Timeout=1200 alpha$'
+}
+
+@test "a bad APT_LOCK_WAIT set before sourcing is corrected once, with one warning" {
+    # shellcheck disable=SC2016
+    run bash -c '
+        APT_LOCK_WAIT=soon
+        . "$1/log.sh"; . "$1/apt.sh"
+        echo "after sourcing: ${APT_LOCK_WAIT}"
+        first="$(apt_lock_wait_message)"
+        second="$(apt_lock_wait_message)"
+        echo "$second"
+    ' _ "$LIB" 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"after sourcing: 1200"* ]]
+    [[ "$output" == *"up to 20 minutes"* ]]
+    [ "$(grep -c "APT_LOCK_WAIT='soon' is not a number of seconds" <<< "$output")" -eq 1 ]
+}
+
+@test "apt.sh sourced before log.sh corrects a bad APT_LOCK_WAIT without dying on a missing log_warn" {
+    # shellcheck disable=SC2016
+    run bash -c '
+        set -euo pipefail
+        APT_LOCK_WAIT=08
+        APT_LOCK_RETRY=0
+        . "$1/apt.sh"
+        echo "sourced: ${APT_LOCK_WAIT} ${APT_LOCK_RETRY}"
+    ' _ "$LIB" 2>&1
+    [ "$status" -eq 0 ]
+    [ "$output" = "sourced: 1200 10" ]
 }
 
 @test "apt_update_wait survives an APT_WAIT_NOTICE_FD that is not open, or not a number" {
@@ -1420,7 +1737,7 @@ if [[ "$*" != *Dir::Etc::sourcelist=* ]]; then : > "${APT_STUB}/update-fail"; fi
 exec bash "$(dirname "$0")/apt-get.real" "$@"
 STUB
     run _add --fingerprint "$FPR_A"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 2 ]
     [ "$(_calls | wc -l)" -eq 2 ]
     [[ "$output" == *"[WARN]"*"passed validation, but the full apt-get update after it failed"* ]]
     [[ "$output" == *"does not have a Release file"* ]]
@@ -1449,7 +1766,7 @@ STUB
     local bad
     for bad in '../x' '-x' 'a/b' '.hidden' 'a b'; do
         run apt_add_repo --fingerprint "$FPR_A" -- "$bad" 'https://example.invalid/key' 'https://example.invalid/repo' stable
-        [ "$status" -eq 1 ]
+        [ "$status" -eq 2 ]
         [[ "$output" == *"apt_add_repo: '${bad}' is not a usable repo name"* ]]
         run apt_remove_repo -- "$bad"
         [ "$status" -eq 1 ]
@@ -1518,7 +1835,7 @@ STUB
     echo 99 > "${APT_STUB}/lock-failures"
     APT_LOCK_WAIT=10
     run _add --fingerprint "$FPR_A"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 2 ]
     [[ "$output" == *"[WARN]"*"was not validated: another apt process held the package lists lock for the whole wait"* ]]
     [[ "$output" != *"does not publish"* ]]
     [[ "$output" != *"failed validation"* ]]
@@ -1539,7 +1856,7 @@ STUB
     echo 99 > "${APT_STUB}/lock-failures"
     APT_LOCK_WAIT=10
     run _add --fingerprint "$FPR_A"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 2 ]
     [[ "$output" != *"does not publish"* ]]
     [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
     grep -qxF 'Suites: old' "${APT_SOURCES_DIR}/fixture.sources.bak"
@@ -1556,6 +1873,391 @@ STUB
     [ -e "${APT_SOURCES_DIR}/fixture.sources" ]
     [ "$(grep -c 'holds the package lists lock' <<< "$output")" -eq 1 ]
     [ "$(grep -c '^sleep 10$' "${APT_STUB}/sleeps")" -eq 1 ]
+}
+
+@test "apt_add_repo returns 1 only for a failed validation, and 2 for every other failure" {
+    _apt_env; WGET_SERVES=a.asc
+    # What a caller that falls back to distro packages does with the status.
+    _try() { local rc=0; ( _add "$@" ) || rc=$?; echo "status ${rc}"; }
+
+    # Wrong as written: fatal, and never 1.
+    run _add
+    [ "$status" -eq 2 ]
+    run _add --fingerprint 'E158C569'
+    [ "$status" -eq 2 ]
+    run _add --fingerprint "$FPR_A" --no-fingerprint
+    [ "$status" -eq 2 ]
+    run _add --bogus
+    [ "$status" -eq 2 ]
+    _after() { _add; echo "still running"; }
+    run _after
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"still running"* ]]
+
+    # The key served is not the pinned one.
+    WGET_SERVES=b.asc
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"not the pinned key"* ]]
+    [[ "$output" == *"status 2"* ]]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+
+    # The key cannot be fetched.
+    WGET_SERVES=no-such-fixture
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"Failed to fetch the signing key"* ]]
+    [[ "$output" == *"status 2"* ]]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+
+    # The repository does not serve the suite: the one case for a fallback.
+    WGET_SERVES=a.asc
+    : > "${APT_STUB}/validate-fail"
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"failed validation"* ]]
+    [[ "$output" == *"status 1"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(apt_key_fingerprints "${APT_KEYRING_DIR}/fixture.gpg")" = "$FPR_A" ]
+
+    # And success.
+    rm -f "${APT_STUB}/validate-fail"
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"status 0"* ]]
+}
+
+@test "apt_add_repo returns 2 when the sources file cannot be written, and when it cannot be backed up" {
+    [[ "$EUID" -eq 0 ]] && skip "root can write anywhere"
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    sed -i 's/^Suites: .*/Suites: old/' "${APT_SOURCES_DIR}/fixture.sources"
+    : > "${APT_STUB}/calls"
+
+    # The directory takes no new file, so the .bak cannot be made.
+    chmod 0555 "$APT_SOURCES_DIR"
+    _try() { local rc=0; ( _add "$@" ) || rc=$?; echo "status ${rc}"; }
+    run _try --fingerprint "$FPR_A"
+    chmod 0755 "$APT_SOURCES_DIR"
+    [[ "$output" == *"status 2"* ]]
+    grep -qxF 'Suites: old' "${APT_SOURCES_DIR}/fixture.sources"
+    [ "$(_calls | wc -l)" -eq 0 ]
+
+    # A new repo whose sources file cannot be created.
+    rm -f "${APT_SOURCES_DIR}/fixture.sources"
+    chmod 0555 "$APT_SOURCES_DIR"
+    run _try --fingerprint "$FPR_A"
+    chmod 0755 "$APT_SOURCES_DIR"
+    [[ "$output" == *"Failed to write"* ]]
+    [[ "$output" == *"status 2"* ]]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+# The scoped validation: what apt printed decides the status. Only "no Release
+# file for the suite" is status 1; the lines are apt's own (3.2.0), with the
+# older "GPG error" wording as well.
+#
+# _validation <exit status> <line>... — the scoped update prints these lines
+# and exits with that status.
+_validation() {
+    echo "$1" > "${APT_STUB}/validate-exit"
+    shift
+    printf '%s\n' "$@" > "${APT_STUB}/validate-output"
+}
+
+@test "apt_add_repo: a repository signed by a key that is not the pinned one is status 2, never a fallback" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    _validation 100 \
+        "Err:1 https://example.invalid/repo stable InRelease" \
+        "  The following signatures couldn't be verified because the public key is not available: NO_PUBKEY 0123456789ABCDEF" \
+        "W: OpenPGP signature verification failed: https://example.invalid/repo stable InRelease: The following signatures couldn't be verified because the public key is not available: NO_PUBKEY 0123456789ABCDEF" \
+        "E: The repository 'https://example.invalid/repo stable InRelease' is not signed."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"[ERROR]"*"the repository's signature could not be verified against the pinned key"* ]]
+    [[ "$output" == *"$FPR_A"* ]]
+    [[ "$output" == *"NO_PUBKEY 0123456789ABCDEF"* ]]
+    [[ "$output" != *"does not publish"* ]]
+    # An unvalidated source does not stay configured, and is not recorded.
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(_journal | grep -c 'fixture.sources')" -eq 0 ]
+    # The scoped update, then the refresh after the removal.
+    [ "$(_calls | wc -l)" -eq 2 ]
+}
+
+@test "apt_add_repo: every wording of a signature failure is status 2" {
+    _apt_env; WGET_SERVES=a.asc
+    local said
+    for said in \
+        "W: GPG error: https://example.invalid/repo stable InRelease: The following signatures couldn't be verified because the public key is not available: NO_PUBKEY 0123456789ABCDEF" \
+        "E: The repository 'https://example.invalid/repo stable Release' is not signed." \
+        "W: OpenPGP signature verification failed: https://example.invalid/repo stable InRelease: The following signatures were invalid: EXPKEYSIG 0123456789ABCDEF Fixture" \
+        "W: An error occurred during the signature verification. The repository is not updated and the previous index files will be used. OpenPGP signature verification failed: https://example.invalid/repo stable InRelease: The following signatures were invalid: BADSIG 0123456789ABCDEF Fixture"; do
+        _validation 100 "$said"
+        run _add --fingerprint "$FPR_A"
+        [ "$status" -eq 2 ]
+        [[ "$output" == *"signature could not be verified against the pinned key"* ]]
+        [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    done
+    # apt calls some signature failures transient and exits 0, keeping old
+    # index files: still not a validated repository.
+    _validation 0 "$said"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    # A missing Release file alongside a signature failure is not status 1.
+    _validation 100 \
+        "W: GPG error: https://example.invalid/repo stable InRelease: NO_PUBKEY 0123456789ABCDEF" \
+        "E: The repository 'https://example.invalid/repo stable Release' does not have a Release file."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+}
+
+@test "apt_add_repo: a repository that cannot be reached is status 2, whether or not apt calls it an error" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    # With Error-Mode=any: errors and a failing exit.
+    _validation 100 \
+        "E: Failed to fetch https://example.invalid/repo/dists/stable/InRelease  Could not resolve 'example.invalid'" \
+        "E: Some index files failed to download. They have been ignored, or old ones used instead."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"[ERROR]"*"the repository at https://example.invalid/repo could not be reached"* ]]
+    [[ "$output" != *"does not publish"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    # The validation asks apt to treat a transient failure as an error.
+    [ "$(_calls | grep -c 'Dir::Etc::sourcelist=.* -o APT::Update::Error-Mode=any$')" -eq 1 ]
+
+    # An apt that only warns and exits 0 has still not reached it.
+    _validation 0 \
+        "W: Failed to fetch https://example.invalid/repo/dists/stable/InRelease  Unable to connect to example.invalid:443:" \
+        "W: Some index files failed to download. They have been ignored, or old ones used instead."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"could not be reached"* ]]
+    [[ "$output" != *"configured"*"[SUCCESS]"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 0 ]
+}
+
+@test "apt_add_repo: a validation failure it does not recognise is status 2" {
+    _apt_env; WGET_SERVES=a.asc
+    _validation 100 "E: Something this function has never heard of."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"for a reason this function does not recognise"* ]]
+    [[ "$output" == *"Something this function has never heard of"* ]]
+    [[ "$output" != *"does not publish"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    # The suite line must be apt's own, at the start of a line.
+    _validation 100 "E: Failed: The repository 'x' does not have a Release file. (quoted by something else)"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+}
+
+@test "apt_add_repo: a missing Release file is status 1 only when the server answered 404, or there is no HTTP at all" {
+    _apt_env; WGET_SERVES=a.asc
+    local rel="E: The repository 'https://example.invalid/repo stable Release' does not have a Release file."
+
+    _validation 100 "Err:2 https://example.invalid/repo stable Release" "  404  Not Found [IP: host 443]" "$rel"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"it probably does not publish"* ]]
+
+    # Lists left from an earlier update change apt's wording, not the meaning.
+    _validation 100 "Err:2 https://example.invalid/repo stable Release" "  404  Not Found" \
+        "E: The repository 'https://example.invalid/repo stable Release' no longer has a Release file."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+
+    # A file: repository has no HTTP status to give.
+    _validation 100 "Err:2 file:/srv/repo stable Release" \
+        "  File not found - /srv/repo/dists/stable/Release (2: No such file or directory)" \
+        "E: The repository 'file:/srv/repo stable Release' does not have a Release file."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 1 ]
+
+    # The line with no 404 behind it says nothing about the suite.
+    _validation 100 "$rel"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" != *"does not publish"* ]]
+    _validation 100 "E: The repository 'https://example.invalid/repo stable Release' no longer has a Release file."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+
+    # Any other HTTP status for it: the server was not in a state to say.
+    _validation 100 "Err:2 https://example.invalid/repo stable Release" "  500  Internal Server Error" "$rel"
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"could not be reached (the server answered HTTP 500)"* ]]
+    [[ "$output" != *"does not publish"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+}
+
+@test "apt_add_repo: a server that refuses access (401, 403) is status 2, and not called a signature failure" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    local code phrase
+    for code in 401 403; do
+        phrase=Forbidden
+        if [[ "$code" == 401 ]]; then
+            phrase=Unauthorized
+        fi
+        # What apt prints for it, "is not signed" included.
+        _validation 100 \
+            "Err:1 https://example.invalid/repo stable InRelease" \
+            "  ${code}  ${phrase}" \
+            "E: Failed to fetch https://example.invalid/repo/dists/stable/InRelease  ${code}  ${phrase}" \
+            "E: The repository 'https://example.invalid/repo stable InRelease' is not signed."
+        run _add --fingerprint "$FPR_A"
+        [ "$status" -eq 2 ]
+        [[ "$output" == *"[ERROR]"*"could not be reached: the server refused access (HTTP ${code})"* ]]
+        [[ "$output" != *"signature could not be verified"* ]]
+        [[ "$output" != *"does not publish"* ]]
+        [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    done
+    [ "$(_journal | grep -c 'fixture.sources')" -eq 0 ]
+}
+
+@test "apt_add_repo: a repository that is no longer signed is a signature failure" {
+    _apt_env; WGET_SERVES=a.asc
+    _validation 100 "E: The repository 'https://example.invalid/repo stable Release' is no longer signed."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"signature could not be verified against the pinned key"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+}
+
+@test "apt_add_repo: a host that accepts unsigned repositories cannot make one validate" {
+    _apt_env; WGET_SERVES=a.asc
+    journal_init "test" "v1"
+    # The validation turns the host's setting off for its own update.
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ "$(_calls | grep -c 'Dir::Etc::sourcelist=.* -o Acquire::AllowInsecureRepositories=0 -o Acquire::AllowDowngradeToInsecureRepositories=0 ')" -eq 1 ]
+    run apt_remove_repo fixture
+    [ "$status" -eq 0 ]
+    : > "$JOURNAL_FILE"
+
+    # And if apt still only warns that there is no Release file, and exits 0:
+    _validation 0 "W: The repository 'https://example.invalid/repo stable Release' does not have a Release file."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"[ERROR]"*"unsigned repository accepted by host configuration"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(_journal | grep -c '"action":"repo"')" -eq 0 ]
+
+    # As apt 3.2.0 goes on with that setting: it tries the index files.
+    _validation 100 \
+        "W: The repository 'https://example.invalid/repo stable Release' does not have a Release file." \
+        "E: Failed to fetch https://example.invalid/repo/dists/stable/main/binary-amd64/Packages  404  Not Found" \
+        "E: Some index files failed to download. They have been ignored, or old ones used instead."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unsigned repository accepted by host configuration"* ]]
+
+    # An unsigned repository it only warns about is a signature failure.
+    _validation 0 "W: The repository 'https://example.invalid/repo stable Release' is not signed."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"signature could not be verified against the pinned key"* ]]
+}
+
+@test "apt_add_repo: a signature failure after a reconfigure keeps the .bak and journals why" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    sed -i 's/^Suites: .*/Suites: old/' "${APT_SOURCES_DIR}/fixture.sources"
+    journal_init "test" "v1"
+    _validation 100 "E: The repository 'https://example.invalid/repo stable InRelease' is not signed."
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    grep -qxF 'Suites: old' "${APT_SOURCES_DIR}/fixture.sources.bak"
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 1 ]
+    _journal | grep '"action":"delete"' | grep -qF 'its signature could not be verified against the pinned key'
+    _journal | grep '"action":"delete"' | grep -qF "\"backup\":\"${APT_SOURCES_DIR}/fixture.sources.bak\""
+}
+
+@test "apt_remove_repo returns 1 and removes nothing when a file cannot be backed up" {
+    [[ "$EUID" -eq 0 ]] && skip "root can write anywhere"
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    journal_init "test" "v1"
+    : > "${APT_STUB}/calls"
+    # No new file can be made next to the sources file, so no .bak.
+    chmod 0555 "$APT_SOURCES_DIR"
+    _then() { apt_remove_repo "$@" || echo "returned $?"; echo "still running"; }
+    run _then fixture
+    chmod 0755 "$APT_SOURCES_DIR"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"returned 1"* ]]
+    [[ "$output" == *"still running"* ]]
+    [[ "$output" == *"Could not back up ${APT_SOURCES_DIR}/fixture.sources; it is untouched"* ]]
+    grep -qxF 'Suites: stable' "${APT_SOURCES_DIR}/fixture.sources"
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+    [ "$(_journal | grep -c '"action":"delete"')" -eq 0 ]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_repo_keyring_pinned says whether the installed keyring holds only pinned keys" {
+    _apt_env; WGET_SERVES=a.asc
+    # No keyring yet.
+    run apt_repo_keyring_pinned fixture "$FPR_A"
+    [ "$status" -eq 1 ]
+
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    : > "${APT_STUB}/calls"
+    run apt_repo_keyring_pinned fixture "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    # Spaces and case are ignored, and a longer list still pins it.
+    run apt_repo_keyring_pinned fixture "$(tr '[:upper:]' '[:lower:]' <<< "$FPR_B"), $(sed 's/.\{4\}/& /g' <<< "$FPR_A")"
+    [ "$status" -eq 0 ]
+    # Another key is not this one.
+    run apt_repo_keyring_pinned fixture "$FPR_B"
+    [ "$status" -eq 1 ]
+    # A keyring holding an extra key is not pinned by one of them.
+    cat "${APTKEYS}/a.gpg" "${APTKEYS}/b.gpg" > "${APT_KEYRING_DIR}/fixture.gpg"
+    run apt_repo_keyring_pinned fixture "$FPR_A"
+    [ "$status" -eq 1 ]
+    run apt_repo_keyring_pinned fixture "${FPR_A},${FPR_B}"
+    [ "$status" -eq 0 ]
+    # It only looks: no apt-get, nothing moved aside.
+    [ "$(_calls | wc -l)" -eq 0 ]
+    [ "$(find "$APT_KEYRING_DIR" -name '*.untrusted.*' | wc -l)" -eq 0 ]
+}
+
+@test "apt_repo_keyring_pinned reads a keyring the invoking user cannot read, and refuses bad arguments" {
+    [[ "$EUID" -eq 0 ]] && skip "root can read anything"
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    # Root-only keyring; the stand-in for root opens it for the one read.
+    chmod 0000 "${APT_KEYRING_DIR}/fixture.gpg"
+    # shellcheck disable=SC2317
+    sudo() {
+        case "${1:-}" in -v|-n) shift ;; esac
+        local rc=0
+        chmod 0600 "${APT_KEYRING_DIR}/fixture.gpg"
+        "$@" || rc=$?
+        chmod 0000 "${APT_KEYRING_DIR}/fixture.gpg"
+        return "$rc"
+    }
+    run apt_repo_keyring_pinned fixture "$FPR_A"
+    [ "$status" -eq 0 ]
+    run apt_repo_keyring_pinned fixture "$FPR_B"
+    [ "$status" -eq 1 ]
+
+    run apt_repo_keyring_pinned '../fixture' "$FPR_A"
+    [ "$status" -eq 2 ]
+    run apt_repo_keyring_pinned fixture 'E158C569'
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"not a key fingerprint"* ]]
+    run apt_repo_keyring_pinned fixture
+    [ "$status" -eq 2 ]
 }
 
 @test "apt_remove_repo backs up the sources file and the keyring, and journals both removals" {
