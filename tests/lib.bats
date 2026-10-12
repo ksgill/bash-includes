@@ -1022,6 +1022,20 @@ _add() {
     [ "$(stat -c %a "${APT_KEYRING_DIR}/fixture.gpg")" = 644 ]
 }
 
+@test "apt_add_repo leaves the sources file world-readable under a restrictive umask" {
+    _apt_env; WGET_SERVES=a.asc
+    _add_umask077() { umask 077; _add "$@"; }
+    run _add_umask077 --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [ "$(stat -c %a "${APT_SOURCES_DIR}/fixture.sources")" = 644 ]
+    # Readable, so the second call sees it is already configured as asked
+    # instead of rewriting it.
+    run _add_umask077 --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already configured"* ]]
+    [[ "$output" != *"different settings"* ]]
+}
+
 @test "apt_add_repo --no-fingerprint installs whatever is served, with a warning" {
     _apt_env; WGET_SERVES=b.asc
     run _add --no-fingerprint

@@ -704,6 +704,16 @@ apt_add_repo() {
         printf 'Signed-By: %s\n'  "$keyring"
     } | sudo tee "$sources" >/dev/null \
         || { log_error "Failed to write ${sources}"; return 2; }
+    # The mode is set, not left to the umask, for the reason the keyring's is:
+    # sudo may hand the caller's umask on, and under 077 tee leaves the file
+    # 0600. apt reads its sources as _apt, so the repository would then be
+    # configured and unusable, and the check at the top of this function, which
+    # reads the file as the invoking user, would call it "different settings"
+    # and rewrite it on every run. A root-owned 0600 file an earlier version
+    # left behind is unreadable to that check, so it is rewritten once more
+    # and comes out 0644.
+    sudo chmod 0644 "$sources" \
+        || { log_error "Failed to make ${sources} readable — apt cannot use the repository as it is"; return 2; }
 
     # ── Validate in isolation ────────────────────────────────────────────────
     # Dir::Etc::sourcelist points at this one file and sourceparts is disabled,
