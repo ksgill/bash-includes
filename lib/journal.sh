@@ -10,7 +10,8 @@
 # computed values. A script that touches nothing durable should not journal.
 #
 # Location: /var/lib, not /var/log. This is state, not a log, and it must
-# survive log rotation. Run transcripts live in /var/log/<script>/ separately.
+# survive log rotation. Run transcripts live beside it, under
+# /var/lib/provision/log/<script>/ (see log.sh for why not /var/log).
 #
 # Format: JSON Lines. Append-only, one object per line — a torn write costs one
 # record instead of the file, and it stays greppable without tooling.

@@ -74,7 +74,7 @@ the backup inside it.
 
 **Persistent changes are journalled** to `/var/lib/provision/changes.jsonl` —
 state, not logs, so it survives log rotation. Run transcripts go to
-`/var/log/<script-name>/` separately. The journal records paths, hashes and
+`/var/lib/provision/log/<script-name>/` (see below). The journal records paths, hashes and
 descriptions; never file contents, because callers handle private keys. The
 system journal is world-readable, so a hash is recorded only for content that
 already is: other-read on the file and other-execute on every ancestor directory. A
@@ -360,6 +360,61 @@ select. A record that names a backup also shows whether the backup still
 exists (`[present]`, `[missing]`, `[unknown]`): presence only, without
 changing the record's own status, with missing backups counted separately in
 the summary line.
+
+## Run transcripts
+
+```bash
+log_open_transcript "$(log_transcript_path my-tool)"          # run-<UTC stamp>.log
+log_open_transcript "$(log_transcript_path my-tool deploy)"   # deploy-<UTC stamp>.log
+```
+
+`log_transcript_path <tool> [label]` prints
+`/var/lib/provision/log/<tool>/<label>-<UTC timestamp>.log`
+(`LOG_TRANSCRIPT_ROOT` moves the root). `log_open_transcript <path>` then
+appends every log line, uncoloured, to that file. It never fails the run: if
+it cannot open a transcript it warns and carries on without one.
+
+Transcripts are **not** under `/var/log`. On Ubuntu `/var/log` is `root:syslog
+0775` with no sticky bit, so the `syslog` account can create `/var/log/<tool>`
+before a tool first runs, or rename a root-owned one away between any two
+commands — and the transcript is created by root and handed to the invoking
+user. No check on a path under such a parent closes that.
+`log_open_transcript` therefore accepts only a directory nobody else can
+interfere with:
+
+- a directory whose every component from `/` down is a real directory owned
+  by root and closed to group and other. Missing components are created
+  `root:root 0755`, one at a time; the file is created by root, owned by the
+  invoking user, mode `0640`;
+- or a directory the invoking user owns that group and other cannot write,
+  reached through ancestors owned by root or that user which others cannot
+  write either (or which are sticky, like `/tmp`). It is created without
+  `sudo` if missing, and so is the file.
+
+The privileged case runs `sudo -n`: it never prompts, and if `sudo` will not
+run without a password the transcript is skipped with a warning that says so.
+
+Anything else — `/var/log/<tool>` on Ubuntu, a new directory directly under `/tmp` — is
+refused with a warning that names the component in the way, and nothing is
+created. An existing file at the path is reused only if it is a regular file
+owned by the invoking user; a link or anything else there is never written
+through.
+
+## Changes in v1.7.0
+
+`log_open_transcript` no longer trusts the directory it is given (it used to
+create it only when absent, never look at who owned an existing one, and
+create the file with a root `touch`, `chown` and `chmod` that followed
+symlinks). It now requires a directory only root, or only the invoking user,
+can write — see *Run transcripts*. **A consumer still passing
+`/var/log/<tool>/…` gets a warning and no transcript on Ubuntu**; switch the
+call to `log_open_transcript "$(log_transcript_path <tool>)"`. Transcript
+files are `0640`, not `0644`. New: `log_transcript_path`,
+`LOG_TRANSCRIPT_ROOT`.
+
+`apt_add_repo` sets the `.sources` file to `0644` itself; under a caller
+umask of 077 it was left `0600`, unreadable to `_apt`, and rewritten on every
+run.
 
 ## Changes in v1.6.0
 

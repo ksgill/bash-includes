@@ -3511,3 +3511,360 @@ _stub_sudo_unavailable() {
     [ "$status" -ne 0 ]
     [[ "$output" == *"not as root"* ]]
 }
+
+# ── log.sh: transcripts ───────────────────────────────────────────────────────
+
+@test "log_transcript_path builds <root>/<tool>/<label>-<UTC stamp>.log" {
+    run bash -c '. "$1/log.sh"; LOG_TRANSCRIPT_ROOT=/x/y; log_transcript_path my-tool; log_transcript_path my-tool deploy' _ "$LIB"
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" =~ ^/x/y/my-tool/run-[0-9]{8}T[0-9]{6}Z\.log$ ]]
+    [[ "${lines[1]}" =~ ^/x/y/my-tool/deploy-[0-9]{8}T[0-9]{6}Z\.log$ ]]
+}
+
+@test "log_transcript_path defaults to /var/lib/provision/log, not /var/log" {
+    run bash -c 'unset LOG_TRANSCRIPT_ROOT; . "$1/log.sh"; log_transcript_path t' _ "$LIB"
+    [[ "$output" == /var/lib/provision/log/t/run-* ]]
+}
+
+@test "log_transcript_path refuses a name that is not one plain path component" {
+    for bad in '' '../x' 'a/b' '.hidden' '-dash' 'a b' 'a$b'; do
+        run bash -c '. "$1/log.sh"; log_transcript_path "$2"' _ "$LIB" "$bad"
+        [ "$status" -ne 0 ]
+        [ -z "$output" ]
+        run bash -c '. "$1/log.sh"; log_transcript_path ok "$2"' _ "$LIB" "$bad"
+        # An empty label means the default, so only the non-empty ones fail.
+        if [ -n "$bad" ]; then [ "$status" -ne 0 ]; fi
+    done
+}
+
+@test "_log_others_can_write reads the group and other write bits, and distrusts what it cannot parse" {
+    for m in 775 757 777 1777 2775 022 702; do
+        run _log_others_can_write "$m"
+        [ "$status" -eq 0 ]
+    done
+    for m in 755 750 700 2755 1755 500 644; do
+        run _log_others_can_write "$m"
+        [ "$status" -ne 0 ]
+    done
+    run _log_others_can_write "garbage"
+    [ "$status" -eq 0 ]
+}
+
+@test "_log_chain lists a directory and every ancestor, root first, newline in a name or not" {
+    _log_chain /var/lib/provision/log/tool
+    [ "${LOG_CHAIN[0]}" = "/" ]
+    [ "${LOG_CHAIN[1]}" = "/var" ]
+    [ "${LOG_CHAIN[4]}" = "/var/lib/provision/log" ]
+    [ "${LOG_CHAIN[5]}" = "/var/lib/provision/log/tool" ]
+    [ "${#LOG_CHAIN[@]}" -eq 6 ]
+    _log_chain /
+    [ "${#LOG_CHAIN[@]}" -eq 1 ]
+    _log_chain $'/a/b\nc/d'
+    [ "${#LOG_CHAIN[@]}" -eq 4 ]
+    [ "${LOG_CHAIN[2]}" = $'/a/b\nc' ]
+}
+
+@test "_log_kind reads the file type from stat's raw mode" {
+    [ "$(_log_kind 41ed)" = "directory" ]
+    [ "$(_log_kind 43ff)" = "directory" ]
+    [ "$(_log_kind 81a4)" = "file" ]
+    [ "$(_log_kind a1ff)" = "link" ]
+    [ "$(_log_kind 11a4)" = "other" ]
+    [ "$(_log_kind '')" = "other" ]
+    [ "$(_log_kind directory)" = "other" ]
+    # The real thing agrees.
+    [ "$(_log_kind "$(stat -c %f "$TMP")")" = "directory" ]
+    ln -s "$TMP" "${TMP}/l"; : > "${TMP}/f"
+    [ "$(_log_kind "$(stat -c %f "${TMP}/l")")" = "link" ]
+    [ "$(_log_kind "$(stat -c %f "${TMP}/f")")" = "file" ]
+}
+
+# A directory of the invoking user's own: no privilege involved. The sudo
+# stub records any call, and there must be none.
+_no_sudo() {
+    # shellcheck disable=SC2317
+    sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.calls"; "$@"; }
+    export -f sudo
+}
+
+@test "log_open_transcript: in the user's own directory it creates the tree and the file without sudo" {
+    _no_sudo
+    log_open_transcript "${TMP}/state/tool/run-1.log"
+    log_info "line one"
+    [ "$_LOG_FILE" = "${TMP}/state/tool/run-1.log" ]
+    grep -q 'line one' "${TMP}/state/tool/run-1.log"
+    [ "$(stat -c %a "${TMP}/state/tool/run-1.log")" = "640" ]
+    [ ! -e "${TMP}/sudo.calls" ]
+}
+
+@test "log_open_transcript: reuses its own regular file, appending" {
+    _no_sudo
+    mkdir -p "${TMP}/state"; echo earlier > "${TMP}/state/run.log"
+    log_open_transcript "${TMP}/state/run.log"
+    log_info "later"
+    [ "$(head -1 "${TMP}/state/run.log")" = "earlier" ]
+    grep -q 'later' "${TMP}/state/run.log"
+}
+
+@test "log_open_transcript: never writes through a symlink at the file path" {
+    _no_sudo
+    mkdir -p "${TMP}/state"; echo secret > "${TMP}/victim"; ln -s "${TMP}/victim" "${TMP}/state/run.log"
+    run log_open_transcript "${TMP}/state/run.log"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"something else is already there"* ]]
+    [ "$(cat "${TMP}/victim")" = "secret" ]
+    log_open_transcript "${TMP}/state/run.log" 2>/dev/null
+    [ -z "$_LOG_FILE" ]
+}
+
+@test "log_open_transcript: refuses its own directory when group or other can write it" {
+    _no_sudo
+    mkdir -p "${TMP}/shared"; chmod 0777 "${TMP}/shared"
+    run log_open_transcript "${TMP}/shared/run.log"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"writable by group or other"* ]]
+    [ ! -e "${TMP}/shared/run.log" ]
+}
+
+@test "log_open_transcript: refuses a symlinked directory" {
+    _no_sudo
+    mkdir -p "${TMP}/real"; ln -s "${TMP}/real" "${TMP}/link"
+    run log_open_transcript "${TMP}/link/run.log"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Not writing a transcript"* ]]
+    [ ! -e "${TMP}/real/run.log" ]
+}
+
+@test "log_open_transcript: refuses a relative or unplain path and stays non-fatal" {
+    for p in 'rel/run.log' '/a/../b/run.log' '/a//b/run.log' '/a/b/' ''; do
+        run log_open_transcript "$p"
+        [ "$status" -eq 0 ]
+        [[ "$output" == *"must be absolute and plain"* ]]
+    done
+}
+
+# The privileged path's decision logic, against a pretend filesystem: the
+# sudo stub answers `test`, `stat` and `install -d` from ${TMP}/fs, one
+# "<path> <uid> <mode> <kind>" line per entry. What is under test is which
+# chains are accepted, what gets created and in what order — the real thing
+# is exercised by the LIB_TEST_REAL_ROOT tests below.
+_fake_fs() {
+    # As root the library runs commands directly, not through sudo, so the
+    # stub would be bypassed and the real filesystem touched.
+    [ "$EUID" -ne 0 ] || skip "the pretend filesystem needs a non-root run"
+    : > "${TMP}/fs"
+    local e
+    for e in "$@"; do printf '%s\n' "$e" >> "${TMP}/fs"; done
+    # shellcheck disable=SC2317
+    sudo() {
+        [[ "${1:-}" == "-n" ]] && shift
+        local target="${*: -1}" line
+        line="$(awk -v p="$target" '$1 == p { $1 = ""; sub(/^ /, ""); print; exit }' "${TMP}/fs")"
+        case "$1" in
+            true)    return 0 ;;
+            test)    [[ -n "$line" ]] ;;
+            stat)    [[ -n "$line" ]] && printf '%s\n' "$line" ;;
+            install) printf 'install %s\n' "${*:2}" >> "${TMP}/sudo.calls"
+                     if [[ "$2" == "-d" ]]; then
+                         printf '%s %s 755 41ed\n' "$target" "${FAKE_MKDIR_OWNER:-0}" >> "${TMP}/fs"
+                     else
+                         printf '%s %s 640 81a0\n' "$target" "$(id -u)" >> "${TMP}/fs"
+                     fi ;;
+            *)       return 1 ;;
+        esac
+    }
+    export -f sudo
+}
+
+@test "_log_root_only_dir: accepts an all-root chain and creates what is missing, parent first" {
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/lib 0 755 41ed"
+    run _log_root_only_dir /var/lib/provision/log/tool
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(sed 's/.* -- //' "${TMP}/sudo.calls" | tr '\n' ' ')" = "/var/lib/provision /var/lib/provision/log /var/lib/provision/log/tool " ]
+    # Every one root:root 0755, by an explicit mode rather than a umask.
+    [ "$(grep -c -- '^install -d -m 0755 -o root -g root -- ' "${TMP}/sudo.calls")" -eq 3 ]
+}
+
+@test "_log_root_only_dir: checks what it has just created, and stops if that is not root's" {
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed"
+    export FAKE_MKDIR_OWNER=104
+    run _log_root_only_dir /var/a/b
+    [ "$status" -ne 0 ]
+    [ "$output" = "/var/a is not owned by root" ]
+    # Nothing was created beneath the component that failed.
+    [ "$(grep -c '^install -d' "${TMP}/sudo.calls")" -eq 1 ]
+}
+
+@test "_log_root_only_dir: refuses a group-writable ancestor before creating anything under it" {
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/log 0 775 41fd"
+    run _log_root_only_dir /var/log/tool
+    [ "$status" -ne 0 ]
+    [ "$output" = "/var/log is writable by group or other (mode 775)" ]
+    [ ! -e "${TMP}/sudo.calls" ]
+}
+
+@test "_log_root_only_dir: refuses a directory someone else already made, a symlink, and a sticky world-writable parent" {
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/x 0 755 41ed" "/var/x/tool 104 755 41ed"
+    run _log_root_only_dir /var/x/tool
+    [ "$status" -ne 0 ]
+    [ "$output" = "/var/x/tool is not owned by root" ]
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/x 0 777 a1ff"
+    run _log_root_only_dir /var/x/tool
+    [ "$status" -ne 0 ]
+    [[ "$output" == "/var/x is not a directory (link)" ]]
+    _fake_fs "/ 0 755 41ed" "/tmp 0 1777 43ff"
+    run _log_root_only_dir /tmp/tool
+    [ "$status" -ne 0 ]
+    [[ "$output" == "/tmp is writable by group or other (mode 1777)" ]]
+}
+
+# log_open_transcript's privileged branch against the same pretend filesystem.
+# The path is one the test user does not own any ancestor of, so the branch is
+# chosen the way it would be for /var/lib/provision/log.
+@test "log_open_transcript (privileged, pretend fs): creates the file 0640 for the caller by uid and gid" {
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/lib 0 755 41ed"
+    run log_open_transcript /var/lib/provision/log/tool/run-1.log
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Transcript: /var/lib/provision/log/tool/run-1.log"* ]]
+    grep -qx -- "install -T -m 0640 -o $(id -u) -g $(id -g) -- /dev/null /var/lib/provision/log/tool/run-1.log" "${TMP}/sudo.calls"
+}
+
+@test "log_open_transcript (privileged, pretend fs): reuses the caller's own regular file, creating nothing" {
+    _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/t 0 755 41ed" "/var/t/run.log $(id -u) 640 81a0"
+    run log_open_transcript /var/t/run.log
+    [[ "$output" == *"Transcript: /var/t/run.log"* ]]
+    [ ! -e "${TMP}/sudo.calls" ]
+}
+
+@test "log_open_transcript (privileged, pretend fs): refuses a file that is someone else's, a link, or a directory" {
+    for entry in "0 600 8180" "$(id -u) 777 a1ff" "$(id -u) 755 41ed"; do
+        _fake_fs "/ 0 755 41ed" "/var 0 755 41ed" "/var/t 0 755 41ed" "/var/t/run.log ${entry}"
+        rm -f "${TMP}/sudo.calls"
+        run log_open_transcript /var/t/run.log
+        [ "$status" -eq 0 ]
+        [[ "$output" == *"something else is already there"* ]]
+        [ ! -e "${TMP}/sudo.calls" ]
+    done
+}
+
+@test "log_open_transcript (privileged): says so when sudo will not run without a prompt, and creates nothing" {
+    [ "$EUID" -ne 0 ] || skip "root does not go through sudo"
+    # shellcheck disable=SC2317
+    sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.calls"; return 1; }
+    export -f sudo
+    run log_open_transcript /var/lib/provision/log/tool/run-1.log
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"sudo is not available without a prompt"* ]]
+    # Only the probe ran, and with -n.
+    [ "$(cat "${TMP}/sudo.calls")" = "-n true" ]
+}
+
+@test "log_open_transcript: refuses its own directory under an ancestor others can rearrange" {
+    _no_sudo
+    mkdir -p "${TMP}/shared"; chmod 0777 "${TMP}/shared"
+    run log_open_transcript "${TMP}/shared/a/b/run.log"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"${TMP}/shared is writable by group or other and not sticky"* ]]
+    # Refused before anything was made under it.
+    [ ! -e "${TMP}/shared/a" ]
+    # The same ancestor with the sticky bit is /tmp's arrangement, and fine.
+    chmod 1777 "${TMP}/shared"
+    log_open_transcript "${TMP}/shared/a/b/run.log"
+    [ "$_LOG_FILE" = "${TMP}/shared/a/b/run.log" ]
+}
+
+@test "log_open_transcript: refuses a symlinked ancestor and a setgid world-writable one in its own chain" {
+    _no_sudo
+    mkdir -p "${TMP}/real/sub"; ln -s "${TMP}/real" "${TMP}/alias"
+    run log_open_transcript "${TMP}/alias/sub/run.log"
+    [[ "$output" == *"${TMP}/alias is not a directory (link)"* ]]
+    [ ! -e "${TMP}/real/sub/run.log" ]
+    mkdir -p "${TMP}/grp/sub"; chmod 2777 "${TMP}/grp"
+    run log_open_transcript "${TMP}/grp/sub/run.log"
+    [[ "$output" == *"${TMP}/grp is writable by group or other and not sticky (mode 2777)"* ]]
+    [ ! -e "${TMP}/grp/sub/run.log" ]
+}
+
+@test "log_open_transcript: refuses a FIFO or a directory at the file path, and a path with a control character" {
+    _no_sudo
+    mkdir -p "${TMP}/state/run.log.d"; mkfifo "${TMP}/state/pipe.log"
+    run log_open_transcript "${TMP}/state/pipe.log"
+    [[ "$output" == *"something else is already there"* ]]
+    run log_open_transcript "${TMP}/state/run.log.d"
+    [[ "$output" == *"something else is already there"* ]]
+    mkdir -p "${TMP}/a"$'\n'"b"; chmod 0777 "${TMP}/a"$'\n'"b"
+    run log_open_transcript "${TMP}/a"$'\n'"b/run.log"
+    [[ "$output" == *"must be absolute and plain"* ]]
+    [ ! -e "${TMP}/a"$'\n'"b/run.log" ]
+}
+
+@test "log_open_transcript: creates its own missing directories one at a time, each 0755 whatever the umask" {
+    _no_sudo
+    umask 077
+    log_open_transcript "${TMP}/s1/s2/s3/run.log"
+    [ "$_LOG_FILE" = "${TMP}/s1/s2/s3/run.log" ]
+    [ "$(stat -c %a "${TMP}/s1" "${TMP}/s1/s2" "${TMP}/s1/s2/s3" | tr '\n' ' ')" = "755 755 755 " ]
+    [ "$(stat -c %a "${TMP}/s1/s2/s3/run.log")" = "640" ]
+}
+
+@test "log_transcript_path treats a root given with a trailing slash as the same root" {
+    run bash -c '. "$1/log.sh"; LOG_TRANSCRIPT_ROOT=/x/y/; log_transcript_path t' _ "$LIB"
+    [[ "$output" =~ ^/x/y/t/run-[0-9TZ]+\.log$ ]]
+}
+
+# The real thing: real sudo, the real /var/lib/provision/log and, on Ubuntu,
+# the real syslog-writable /var/log. Changes the host (and cleans up), so it
+# runs only when asked: LIB_TEST_REAL_ROOT=1 with passwordless sudo.
+_real_root() {
+    [ "${LIB_TEST_REAL_ROOT:-}" = 1 ] || skip "set LIB_TEST_REAL_ROOT=1 to run against the real filesystem"
+    command sudo -n true 2>/dev/null || skip "needs passwordless sudo"
+    unset -f sudo
+    REAL_TOOL="bats-libtest-$$-${RANDOM}"
+    REAL_HAD_PROVISION=0
+    [ -d /var/lib/provision ] && REAL_HAD_PROVISION=1
+    return 0
+}
+# Removes what the test made and nothing that was there before: the two
+# parents go only if they are empty, and /var/lib/provision only if the test
+# created it.
+_real_root_cleanup() {
+    command sudo rm -rf -- "/var/lib/provision/log/${REAL_TOOL}" "/var/log/${REAL_TOOL}"
+    command sudo rmdir -- /var/lib/provision/log 2>/dev/null || true
+    if [ "$REAL_HAD_PROVISION" -eq 0 ]; then
+        command sudo rmdir -- /var/lib/provision 2>/dev/null || true
+    fi
+}
+
+@test "log_open_transcript (real root): creates a root-owned directory and a 0640 file owned by the caller" {
+    _real_root
+    run bash -c 'set -euo pipefail; . "$1/log.sh"; p="$(log_transcript_path "$2")"; log_open_transcript "$p"; log_info "hello"
+        printf "%s|%s|%s\n" "$(stat -c "%U:%G %a" -- "${p%/*}")" "$(stat -c "%U %a" -- "$p")" "$(grep -c hello "$p")"' _ "$LIB" "$REAL_TOOL"
+    _real_root_cleanup
+    [ "$status" -eq 0 ]
+    [ "${lines[-1]}" = "root:root 755|$(id -un) 640|1" ]
+}
+
+@test "log_open_transcript (real root): refuses /var/log/<tool> where /var/log is writable by a group, creating nothing" {
+    _real_root
+    if ! _log_others_can_write "$(stat -c %a /var/log)"; then _real_root_cleanup; skip "/var/log is root-only on this host"; fi
+    run bash -c 'set -euo pipefail; . "$1/log.sh"; log_open_transcript "/var/log/$2/run-1.log" 2>&1; echo "file=[$_LOG_FILE]"' _ "$LIB" "$REAL_TOOL"
+    local made=0; command sudo test -e "/var/log/${REAL_TOOL}" && made=1
+    _real_root_cleanup
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"/var/log is writable by group or other"* ]]
+    [[ "$output" == *"file=[]"* ]]
+    [ "$made" -eq 0 ]
+}
+
+@test "log_open_transcript (real root): will not hand over a file that is already there and not the caller's" {
+    _real_root
+    command sudo install -d -m 0755 -o root -g root "/var/lib/provision/log" "/var/lib/provision/log/${REAL_TOOL}"
+    command sudo install -m 0600 -o root -g root /dev/null "/var/lib/provision/log/${REAL_TOOL}/run-1.log"
+    run bash -c 'set -euo pipefail; . "$1/log.sh"; log_open_transcript "/var/lib/provision/log/$2/run-1.log" 2>&1; echo "file=[$_LOG_FILE]"' _ "$LIB" "$REAL_TOOL"
+    local owner; owner="$(command sudo stat -c '%U %a' "/var/lib/provision/log/${REAL_TOOL}/run-1.log")"
+    _real_root_cleanup
+    [[ "$output" == *"something else is already there"* ]]
+    [[ "$output" == *"file=[]"* ]]
+    [ "$owner" = "root 600" ]
+}
