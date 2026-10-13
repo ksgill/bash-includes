@@ -25,6 +25,9 @@ _CLEANUP_STACK=()
 #
 #   cleanup_push "sudo losetup -d '$LOOP_DEV'"
 #   cleanup_push sudo_keepalive_stop
+#
+# Handlers run with INT, TERM, HUP and PIPE ignored, and so does everything
+# they start: keep them short, and do not launch anything long-lived from one.
 cleanup_push() {
     _CLEANUP_STACK+=("$*")
 }
@@ -32,6 +35,16 @@ cleanup_push() {
 _cleanup_run() {
     local rc=$?
     local i
+
+    # A signal during teardown must not cut it short: the handlers below run
+    # `exit`, and `exit` inside the EXIT trap ends the shell with the rest of
+    # the stack unrun. Ctrl-C twice, or the terminal closing (SIGHUP) while a
+    # Ctrl-C is still being cleaned up after, would leave resources behind.
+    # Ignored rather than trapped so the commands a handler starts ignore
+    # them too. SIGQUIT (Ctrl-\) still stops a teardown that hangs.
+    # PIPE as well: a hangup also kills the `tee` in `script | tee log`, and
+    # the first log line of the teardown would then kill the shell.
+    trap '' INT TERM HUP PIPE
 
     # Reverse order: last registered is torn down first.
     for (( i=${#_CLEANUP_STACK[@]} - 1; i >= 0; i-- )); do
@@ -50,3 +63,7 @@ trap _cleanup_run EXIT
 # tell an interrupt apart from a normal failure.
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# A closed terminal or dropped SSH session: without this bash dies on the
+# default action and no handler runs. Under nohup, HUP is ignored on entry
+# and bash keeps it that way; this line then does nothing.
+trap 'exit 129' HUP

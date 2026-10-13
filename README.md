@@ -400,6 +400,19 @@ created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
 
+## Changes in v1.7.1
+
+`cleanup.sh` traps SIGHUP (`exit 129`), so a closed terminal or a dropped SSH
+session runs the handlers; before, bash died on the default action and nothing
+was torn down (a run under `nohup` still ignores HUP, as before). While the
+handlers run, INT, TERM, HUP and PIPE are ignored — by the shell and by the
+commands the handlers start — so a second Ctrl-C, a hangup arriving during a
+Ctrl-C's teardown, or a log line written to a pipe whose reader has gone, no
+longer ends it half way with the rest of the stack unrun. A script that tears
+something down on Ctrl-C now does the same on a hangup. **A teardown that hangs can no longer be stopped
+with Ctrl-C; SIGQUIT (Ctrl-\\) still stops it.** A script that set its own HUP
+trap after sourcing `cleanup.sh` keeps it.
+
 ## Changes in v1.7.0
 
 `log_open_transcript` no longer trusts the directory it is given (it used to

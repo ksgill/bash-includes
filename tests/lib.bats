@@ -2808,6 +2808,65 @@ _row() { grep -E "  $1 +${TMP}/" <<< "$output" || true; }
     [ "$status" -eq 42 ]
 }
 
+@test "SIGHUP runs the cleanup handlers and exits 129" {
+    run bash -c "
+        . '${LIB}/log.sh'
+        . '${LIB}/cleanup.sh'
+        cleanup_push 'echo cleaned'
+        kill -HUP \$\$
+        sleep 5
+        echo not-reached
+    "
+    [ "$status" -eq 129 ]
+    [ "$output" = "cleaned" ]
+}
+
+@test "a signal during cleanup does not cut the remaining handlers short" {
+    # First handler to run signals the shell three ways, as a second Ctrl-C
+    # or a closing terminal would; the handler registered before it must
+    # still run and the original exit code must stand.
+    run bash -c "
+        . '${LIB}/log.sh'
+        . '${LIB}/cleanup.sh'
+        cleanup_push 'echo last'
+        cleanup_push 'kill -INT \$\$; kill -HUP \$\$; kill -TERM \$\$; sleep 0.2; echo first'
+        exit 7
+    "
+    [ "$status" -eq 7 ]
+    [ "${lines[0]}" = "first" ]
+    [ "${lines[1]}" = "last" ]
+}
+
+@test "a log line to a closed pipe during cleanup does not stop the handlers" {
+    # The reader is gone before teardown starts; the first handler's output
+    # hits a dead pipe, the second must still run.
+    run bash -c "
+        bash -c \"
+            . '${LIB}/log.sh'
+            . '${LIB}/cleanup.sh'
+            cleanup_push 'touch ${BATS_TEST_TMPDIR}/second-ran'
+            cleanup_push 'echo to-a-dead-pipe; echo again'
+            sleep 0.5
+            exit 3
+        \" 2>/dev/null | true
+        echo \"rc=\${PIPESTATUS[0]}\"
+    "
+    [ "$output" = "rc=3" ]
+    [ -e "${BATS_TEST_TMPDIR}/second-ran" ]
+}
+
+@test "commands started by a cleanup handler ignore INT, TERM and HUP too" {
+    run bash -c "
+        . '${LIB}/log.sh'
+        . '${LIB}/cleanup.sh'
+        cleanup_push 'bash -c \"kill -HUP \\\$\\\$; kill -INT \\\$\\\$; kill -TERM \\\$\\\$; echo child-survived\"'
+        kill -INT \$\$
+        sleep 5
+    "
+    [ "$status" -eq 130 ]
+    [ "$output" = "child-survived" ]
+}
+
 # ── net.sh ────────────────────────────────────────────────────────────────────
 
 @test "mask_to_cidr converts common masks" {
