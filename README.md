@@ -20,11 +20,13 @@ lib/privilege.sh      enforce run-as-user / escalate-per-command
 lib/cleanup.sh        stack of teardown handlers sharing one EXIT trap
 lib/journal.sh        append-only record of persistent system changes
 lib/backup.sh         the .orig / .bak backup convention
+lib/teardown.sh       snapshot what a rebuild removes, stop units, remove it
 lib/os.sh             OS, arch, kernel, init and session detection
 lib/apt.sh            APT repository and package helpers
 lib/host.sh           hostname validation and setting
 lib/net.sh            address, mask and range arithmetic
 lib/oui.sh            MAC vendor lookup
+lib/mac.sh            read an interface's MAC address; set it and read it back
 lib/git.sh            git identity, GitHub ssh stanza, pinned host key
 bin/provision-report  read and verify the change journal
 bin/bld               resolve # include: directives into a self-contained script
@@ -399,6 +401,36 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.8.0
+
+Two new modules; nothing existing changes, so a consumer that uses neither can
+move to this tag with no difference in its dist beyond the stamp.
+
+`teardown.sh` is for a tool that replaces an installation it made earlier.
+`snapshot_create <root> <name>` makes a root-owned 0700 directory
+`<root>/<name>-<timestamp>`; `snapshot_add <path> [name]` copies a path into it
+(`cp -a`) and registers it; `snapshot_remove_all [detail]` then removes each
+registered path, journalled with where its copy is. Every failed copy is
+fatal while nothing has been removed yet, and at removal a path goes only if
+its copy is in the snapshot at that moment. `snapshot_register <path> <copy>`
+adds a path the caller copied its own way. When a removal fails half way the
+function named in `SNAPSHOT_ON_FAIL` is called with what failed and can read
+`SNAPSHOT_REMOVED_SRC` / `SNAPSHOT_REMOVED_COPY`; without one, a generic report
+lists what is gone and the `cp` commands that put it back
+(`snapshot_failure_report`, which a handler may call before adding its own).
+`unit_stop_disable <unit> <reason>` stops a unit that is active or failed,
+clears a failed state and disables it, journalling each step; it returns 1
+only when the stop itself failed. Which paths, what to check first and any
+firewall cleanup stay with the caller. Snapshots hold whatever was copied,
+private keys included, and are never pruned.
+
+`mac.sh`: `mac_get <iface>` prints the current address; `mac_set <iface>
+<mac>` takes the link down, sets the address and reads it back, returning a
+distinct status for a malformed address (1), a link that would not go down
+(2), an address the kernel rejected (3) and one it accepted but the interface
+does not report (4). The link is left down, and where the original address is
+kept is the caller's business.
 
 ## Changes in v1.7.1
 

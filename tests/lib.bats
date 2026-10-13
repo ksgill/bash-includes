@@ -3927,3 +3927,344 @@ _real_root_cleanup() {
     [[ "$output" == *"file=[]"* ]]
     [ "$owner" = "root 600" ]
 }
+
+# ── teardown.sh ───────────────────────────────────────────────────────────────
+# install -o root -g root cannot run unprivileged; the stubbed sudo runs this
+# function instead, which drops the owner and keeps the rest.
+_teardown_env() {
+    # shellcheck disable=SC2317
+    install() {
+        local -a a=()
+        while (( $# )); do
+            case "$1" in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac
+        done
+        command install "${a[@]}"
+    }
+    # shellcheck source=/dev/null
+    . "${LIB}/teardown.sh"
+    journal_init "test" "v1"
+    SRC="${TMP}/etc/vpn"
+    ROOT="${TMP}/opt/backups"
+    mkdir -p "${SRC}/work/sub"
+    echo key > "${SRC}/server.key"; chmod 0600 "${SRC}/server.key"
+    echo conf > "${SRC}/server.conf"
+    echo deep > "${SRC}/work/sub/file"
+    ln -s server.conf "${SRC}/link"
+}
+
+@test "snapshot: copies, then removes, and journals each with where the copy is" {
+    _teardown_env
+    snapshot_create "$ROOT" home
+    snapshot_add "${SRC}/work" work_dir
+    snapshot_add "${SRC}/server.key"
+    snapshot_add "${SRC}/server.conf"
+    snapshot_add "${SRC}/link"
+    [ "$(stat -c %a "$ROOT")" = 700 ]
+    [ "$(stat -c %a "$SNAPSHOT_DIR")" = 700 ]
+    [[ "$SNAPSHOT_DIR" =~ ^${ROOT}/home-[0-9]{8}-[0-9]{6}$ ]]
+    # Nothing is removed by the copy phase.
+    [ -f "${SRC}/server.key" ] && [ -d "${SRC}/work" ]
+
+    snapshot_remove_all "removed by --force-rebuild"
+    [ ! -e "${SRC}/work" ]
+    [ ! -e "${SRC}/server.key" ]
+    [ ! -e "${SRC}/server.conf" ]
+    [ ! -L "${SRC}/link" ]
+    [ "$(cat "${SNAPSHOT_DIR}/work_dir/sub/file")" = deep ]
+    [ "$(stat -c %a "${SNAPSHOT_DIR}/server.key")" = 600 ]
+    [ -L "${SNAPSHOT_DIR}/link" ]
+    [ "${#SNAPSHOT_REMOVED_SRC[@]}" -eq 4 ]
+    [ "$(grep -c '"action":"backup"' "$JOURNAL_FILE")" -eq 4 ]
+    [ "$(grep -c '"action":"delete"' "$JOURNAL_FILE")" -eq 4 ]
+    grep -F '"action":"delete"' "$JOURNAL_FILE" | grep -F "\"target\":\"${SRC}/work\"" \
+        | grep -F '"detail":"removed by --force-rebuild"' | grep -qF "\"backup\":\"${SNAPSHOT_DIR}/work_dir\""
+}
+
+@test "snapshot: a path that is not there is neither copied nor removed, and is not an error" {
+    _teardown_env
+    snapshot_create "$ROOT" home
+    snapshot_add "${SRC}/absent"
+    snapshot_add "${SRC}/server.conf"
+    snapshot_remove_all
+    [ ! -e "${SNAPSHOT_DIR}/absent" ]
+    [ ! -e "${SRC}/server.conf" ]
+    [ "${#SNAPSHOT_REMOVED_SRC[@]}" -eq 1 ]
+}
+
+@test "snapshot: a path that appeared after the copy stops the removal there, with a recovery list" {
+    _teardown_env
+    run bash -c 'set -euo pipefail
+        '"$(declare -f sudo install)"'
+        . "$1/log.sh"; . "$1/journal.sh"; . "$1/teardown.sh"; journal_init t v1
+        snapshot_create "$2" home
+        snapshot_add "$3/server.conf"
+        snapshot_add "$3/late"
+        snapshot_add "$3/server.key"
+        echo new > "$3/late"
+        snapshot_remove_all 2>&1
+        echo reached' _ "$LIB" "$ROOT" "$SRC"
+    [ "$status" -eq 1 ]
+    [[ "$output" != *reached* ]]
+    [[ "$output" == *"Not removing ${SRC}/late: its copy"*"is not in the snapshot"* ]]
+    [[ "$output" == *"sudo cp -a -T -- '${ROOT}/home-"*"/server.conf' '${SRC}/server.conf'"* ]]
+    [ ! -e "${SRC}/server.conf" ]
+    [ -f "${SRC}/late" ]
+    # What follows the failure in the list is left alone.
+    [ -f "${SRC}/server.key" ]
+}
+
+@test "snapshot: SNAPSHOT_ON_FAIL gets the failed path and its copy, and sees what is already gone" {
+    _teardown_env
+    run bash -c 'set -euo pipefail
+        '"$(declare -f sudo install)"'
+        . "$1/log.sh"; . "$1/journal.sh"; . "$1/teardown.sh"; journal_init t v1
+        rm() { if [[ "${*: -1}" == */work ]]; then return 1; fi; command rm "$@"; }
+        on_fail() { echo "handler: $1"; echo "partial=[$2] copy=[$3]"; echo "gone=${SNAPSHOT_REMOVED_SRC[*]}"; }
+        SNAPSHOT_ON_FAIL=on_fail
+        snapshot_create "$2" home
+        snapshot_add "$3/server.conf"
+        snapshot_add "$3/work" work_dir
+        snapshot_add "$3/server.key"
+        snapshot_remove_all 2>&1
+        echo reached' _ "$LIB" "$ROOT" "$SRC"
+    # The handler returned instead of exiting: the run still ends, status 1.
+    [ "$status" -eq 1 ]
+    [[ "$output" != *reached* ]]
+    [[ "$output" == *"handler: Failed to remove ${SRC}/work"* ]]
+    [[ "$output" == *"partial=[${SRC}/work] copy=[${ROOT}/home-"*"/work_dir]"* ]]
+    [[ "$output" == *"gone=${SRC}/server.conf"* ]]
+    [ -f "${SRC}/server.key" ]
+    [ "$(grep -c '"action":"delete"' "$JOURNAL_FILE")" -eq 1 ]
+}
+
+@test "snapshot: a handler can give the generic report and add to it" {
+    _teardown_env
+    run bash -c 'set -euo pipefail
+        '"$(declare -f sudo install)"'
+        . "$1/log.sh"; . "$1/journal.sh"; . "$1/teardown.sh"; journal_init t v1
+        rm() { if [[ "${*: -1}" == */server.key ]]; then return 1; fi; command rm "$@"; }
+        on_fail() { snapshot_failure_report "$@"; log_error "Then: sudo systemctl enable --now vpn"; }
+        SNAPSHOT_ON_FAIL=on_fail
+        snapshot_create "$2" home
+        snapshot_add "$3/server.conf"
+        snapshot_add "$3/server.key"
+        snapshot_remove_all 2>&1' _ "$LIB" "$ROOT" "$SRC"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Failed to remove ${SRC}/server.key"* ]]
+    [[ "$output" == *"sudo cp -a -T -- '${ROOT}/home-"*"/server.conf' '${SRC}/server.conf'"* ]]
+    [[ "$output" == *"sudo rm -rf -- '${SRC}/server.key'"* ]]
+    [[ "${lines[-1]}" == *"Then: sudo systemctl enable --now vpn" ]]
+}
+
+@test "snapshot: a failed copy is fatal, carries the caller's note, and removes nothing" {
+    _teardown_env
+    run bash -c 'set -euo pipefail
+        '"$(declare -f sudo install)"'
+        . "$1/log.sh"; . "$1/journal.sh"; . "$1/teardown.sh"; journal_init t v1
+        cp() { return 1; }
+        SNAPSHOT_FAIL_NOTE="no files have been removed and the service was not touched"
+        snapshot_create "$2" home
+        snapshot_add "$3/server.conf" 2>&1
+        echo reached' _ "$LIB" "$ROOT" "$SRC"
+    [ "$status" -eq 1 ]
+    [[ "$output" != *reached* ]]
+    [[ "$output" == *"Could not back up ${SRC}/server.conf to "*"; no files have been removed and the service was not touched"* ]]
+    [ -f "${SRC}/server.conf" ]
+}
+
+@test "snapshot: two paths that would share a name in the snapshot are refused" {
+    _teardown_env
+    mkdir -p "${SRC}/other"; echo x > "${SRC}/other/server.conf"
+    snapshot_create "$ROOT" home
+    snapshot_add "${SRC}/server.conf"
+    run snapshot_add "${SRC}/other/server.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is already in the snapshot"* ]]
+    [ "$(cat "${SNAPSHOT_DIR}/server.conf")" = conf ]
+}
+
+@test "snapshot: a symlinked root is refused; --keep-root leaves an existing root as it is" {
+    _teardown_env
+    mkdir -p "${TMP}/elsewhere"
+    ln -s "${TMP}/elsewhere" "${TMP}/linkroot"
+    run snapshot_create "${TMP}/linkroot" home
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is a symlink; refusing"* ]]
+    [ -z "$(ls -A "${TMP}/elsewhere")" ]
+
+    mkdir -p "$ROOT"; chmod 0750 "$ROOT"
+    snapshot_create --keep-root "$ROOT" home
+    [ "$(stat -c %a "$ROOT")" = 750 ]
+    [ "$(stat -c %a "$SNAPSHOT_DIR")" = 700 ]
+    # Without it the root is reset to 0700.
+    date() { echo 20990101-000000; }
+    snapshot_create "$ROOT" home
+    [ "$(stat -c %a "$ROOT")" = 700 ]
+}
+
+@test "snapshot: a second snapshot in the same second fails instead of sharing the directory" {
+    _teardown_env
+    date() { echo 20260101-120000; }
+    snapshot_create "$ROOT" home
+    run snapshot_create "$ROOT" home
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not create ${ROOT}/home-20260101-120000"* ]]
+}
+
+@test "snapshot_register: refuses /, //, a relative path, an empty one and . or .. components" {
+    _teardown_env
+    local p
+    for p in / "" relative/path // /// /.. /etc/../ /etc/./x /.; do
+        run snapshot_register "$p" /x/copy
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"refusing to register"* ]]
+    done
+    run snapshot_register /etc/x relative
+    [ "$status" -eq 1 ]
+}
+
+@test "snapshot_register: a path the caller copied itself is removed like the rest" {
+    _teardown_env
+    snapshot_create "$ROOT" home
+    mkdir "${SNAPSHOT_DIR}/jail"
+    cp -a "${SRC}/work/sub" "${SNAPSHOT_DIR}/jail/"
+    snapshot_register "${SRC}/work" "${SNAPSHOT_DIR}/jail"
+    snapshot_remove_all
+    [ ! -e "${SRC}/work" ]
+    [ "${SNAPSHOT_REMOVED_COPY[0]}" = "${SNAPSHOT_DIR}/jail" ]
+}
+
+# systemctl stub: state comes from ${TMP}/unit.state, calls go to systemctl.calls.
+_systemctl_stub() {
+    # shellcheck disable=SC2317
+    systemctl() {
+        local state; state="$(cat "${TMP}/unit.state" 2>/dev/null || echo inactive)"
+        case "$1" in
+            is-active) [[ "$state" == active ]] ;;
+            is-failed) [[ "$state" == failed ]] ;;
+            stop)
+                printf '%s\n' "$*" >> "${TMP}/systemctl.calls"
+                [[ ! -e "${TMP}/stop.fails" ]] || return 1
+                [[ "$state" == failed ]] || echo inactive > "${TMP}/unit.state" ;;
+            reset-failed)
+                printf '%s\n' "$*" >> "${TMP}/systemctl.calls"
+                echo inactive > "${TMP}/unit.state" ;;
+            *) printf '%s\n' "$*" >> "${TMP}/systemctl.calls" ;;
+        esac
+    }
+}
+
+@test "unit_stop_disable: an inactive unit is left alone" {
+    _teardown_env; _systemctl_stub
+    unit_stop_disable "vpn@x.service" "--force-rebuild"
+    [ "$UNIT_STOPPED" -eq 0 ]
+    [ ! -e "${TMP}/systemctl.calls" ]
+    ! grep -q '"action":"service"' "$JOURNAL_FILE"
+}
+
+@test "unit_stop_disable: an active unit is stopped and disabled, both journalled" {
+    _teardown_env; _systemctl_stub
+    echo active > "${TMP}/unit.state"
+    unit_stop_disable "vpn@x.service" "--force-rebuild"
+    [ "$UNIT_STOPPED" -eq 1 ]
+    [ "$(cat "${TMP}/systemctl.calls")" = "stop vpn@x.service
+disable vpn@x.service" ]
+    grep -qF '"detail":"stopped for --force-rebuild"' "$JOURNAL_FILE"
+    grep -qF '"detail":"disabled for --force-rebuild"' "$JOURNAL_FILE"
+}
+
+@test "unit_stop_disable: a failed unit is stopped, reset and disabled" {
+    _teardown_env; _systemctl_stub
+    echo failed > "${TMP}/unit.state"
+    unit_stop_disable "vpn@x.service" "--force-rebuild"
+    [ "$UNIT_STOPPED" -eq 1 ]
+    [ "$(cat "${TMP}/systemctl.calls")" = "stop vpn@x.service
+reset-failed vpn@x.service
+disable vpn@x.service" ]
+    grep -qF '"detail":"failed state reset for --force-rebuild"' "$JOURNAL_FILE"
+}
+
+@test "unit_stop_disable: a failed stop returns 1 with nothing journalled or disabled" {
+    _teardown_env; _systemctl_stub
+    echo active > "${TMP}/unit.state"; : > "${TMP}/stop.fails"
+    run unit_stop_disable "vpn@x.service" "--force-rebuild"
+    [ "$status" -eq 1 ]
+    [ "$(cat "${TMP}/systemctl.calls")" = "stop vpn@x.service" ]
+    ! grep -q '"action":"service"' "$JOURNAL_FILE"
+}
+
+@test "snapshot (real root): root and snapshot are root 0700, and a root 0600 file keeps owner and mode" {
+    _real_root
+    local base="/var/tmp/${REAL_TOOL}"
+    command sudo install -d -m 0700 -o root -g root "$base" "${base}/etc"
+    command sudo install -m 0600 -o root -g root /dev/null "${base}/etc/server.key"
+    run bash -c 'set -euo pipefail; . "$1/log.sh"; . "$1/journal.sh"; . "$1/teardown.sh"
+        JOURNAL_DIR="$2/journal"; journal_init t v1 >/dev/null 2>&1
+        snapshot_create "$2/backups" vpn 2>/dev/null
+        snapshot_add "$2/etc/server.key" 2>/dev/null
+        snapshot_remove_all 2>/dev/null
+        printf "%s|%s|%s|" "$(sudo stat -c "%U:%G %a" "$2/backups")" "$(sudo stat -c "%U:%G %a" "$SNAPSHOT_DIR")" \
+            "$(sudo stat -c "%U:%G %a" "$SNAPSHOT_DIR/server.key")"
+        sudo test -e "$2/etc/server.key" && echo present || echo gone' _ "$LIB" "$base"
+    command sudo rm -rf -- "$base"
+    _real_root_cleanup
+    [ "$status" -eq 0 ]
+    [ "${lines[-1]}" = "root:root 700|root:root 700|root:root 600|gone" ]
+}
+
+# ── mac.sh ────────────────────────────────────────────────────────────────────
+# A fake sysfs and an `ip` that writes the address into it, unless told to
+# misbehave through ${TMP}/ip.mode.
+_mac_env() {
+    export _MAC_SYSFS="${TMP}/sys/class/net"
+    mkdir -p "${_MAC_SYSFS}/wlan9"
+    echo "AA:bb:cc:00:11:22" > "${_MAC_SYSFS}/wlan9/address"
+    # shellcheck disable=SC2317
+    ip() {
+        printf '%s\n' "$*" >> "${TMP}/ip.calls"
+        local mode; mode="$(cat "${TMP}/ip.mode" 2>/dev/null || true)"
+        case "$*" in
+            *" down")    [[ "$mode" != nodown ]] ;;
+            *" address "*)
+                [[ "$mode" != reject ]] || return 1
+                [[ "$mode" == ignore ]] || echo "${*: -1}" > "${_MAC_SYSFS}/wlan9/address" ;;
+        esac
+    }
+    # shellcheck source=/dev/null
+    . "${LIB}/mac.sh"
+}
+
+@test "mac_get: prints the address in lower case, and fails for an interface that is not there" {
+    _mac_env
+    [ "$(mac_get wlan9)" = "aa:bb:cc:00:11:22" ]
+    run mac_get nosuch0
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+    run mac_get ../wlan9
+    [ "$status" -eq 1 ]
+}
+
+@test "mac_set: takes the link down, sets the address, reads it back, and leaves the link down" {
+    _mac_env
+    mac_set wlan9 02:AA:bb:cc:dd:ee
+    [ "$(mac_get wlan9)" = "02:aa:bb:cc:dd:ee" ]
+    [ "$(cat "${TMP}/ip.calls")" = "link set dev wlan9 down
+link set dev wlan9 address 02:AA:bb:cc:dd:ee" ]
+}
+
+@test "mac_set: each way of failing has its own status" {
+    _mac_env
+    run mac_set wlan9 "02:aa:bb:cc:dd"
+    [ "$status" -eq 1 ]
+    [ ! -e "${TMP}/ip.calls" ]
+    run mac_set wlan9 "02:aa:bb:cc:dd:ee; reboot"
+    [ "$status" -eq 1 ]
+    echo nodown > "${TMP}/ip.mode"; run mac_set wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 2 ]
+    echo reject > "${TMP}/ip.mode"; run mac_set wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 3 ]
+    # Accepted by the kernel, but the interface still reports the old address.
+    echo ignore > "${TMP}/ip.mode"; run mac_set wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 4 ]
+    [ -z "$output" ]
+}
