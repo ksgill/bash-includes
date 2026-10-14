@@ -176,17 +176,55 @@ _apt_backup() {
     fi
 }
 
+# ── Temporary files ──────────────────────────────────────────────────────────
+# Every temporary file this module makes is removed by the function that made
+# it. These two are for the run that does not get that far: with cleanup.sh
+# loaded, whatever is registered here and still exists is removed at exit.
+# Register from the shell that holds the cleanup stack, never from inside a
+# command or process substitution, where the registration ends with the
+# subshell (apt_key_fingerprints, which runs there, cleans up on its own).
+_APT_TMPS=()
+_APT_TMP_HANDLER=""
+_apt_tmp_register() {
+    _APT_TMPS+=("$1")
+    if [[ -z "$_APT_TMP_HANDLER" ]] && declare -f cleanup_push >/dev/null 2>&1; then
+        cleanup_push _apt_tmp_cleanup
+        _APT_TMP_HANDLER=1
+    fi
+}
+_apt_tmp_cleanup() {
+    [[ ${#_APT_TMPS[@]} -gt 0 ]] || return 0
+    # Files only (the gpg home is handled by apt_key_fingerprints itself), so
+    # -f, not -rf. Names already removed by their owner cost nothing here.
+    rm -f -- "${_APT_TMPS[@]}" 2>/dev/null || true
+    _APT_TMPS=()
+}
+
 # ── apt_key_fingerprints <file> ──────────────────────────────────────────────
 # Print the fingerprint of every primary key in <file>, one per line, upper
 # case. <file> may be ASCII-armoured or a binary keyring. Runs gpg with a
-# throwaway GNUPGHOME, so the caller's own keyring is never created or read.
-# Returns non-zero if the file holds no key gpg can read.
+# throwaway GNUPGHOME, so the caller's own keyring is never created or read
+# (gpg 2.4.8 will not run without a home it can write; --no-keyring does not
+# change that). Returns non-zero if the file holds no key gpg can read.
+#
+# The home is made and removed inside the subshell that runs gpg: its EXIT
+# trap removes it, and bash runs that trap when a signal ends the subshell
+# as well (checked: with the INT trap removed, an interrupt during gpg still
+# left nothing behind). The INT, TERM and HUP traps give an interrupted
+# substitution a definite status (130, 143, 129) instead of a death by
+# signal. The cleanup stack is no use here: this function runs from command
+# and process substitutions, where a registration would end with the
+# subshell.
 apt_key_fingerprints() {
-    local file="$1" home listing
-    home="$(mktemp -d)" || return 1
-    listing="$(GNUPGHOME="$home" gpg --batch --quiet --with-colons --show-keys -- "$file" 2>/dev/null)" \
-        || { rm -rf "$home"; return 1; }
-    rm -rf "$home"
+    local file="$1" listing
+    listing="$(
+        home="$(mktemp -d)" || exit 1
+        trap 'rm -rf -- "$home"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+        GNUPGHOME="$home" gpg --batch --quiet --with-colons --show-keys -- "$file" 2>/dev/null
+    )" || return 1
     # The fpr record straight after a pub record is that primary key's.
     awk -F: '/^pub:/ { want = 1; next } want && /^fpr:/ { print toupper($10); want = 0 }' <<< "$listing" \
         | grep . || return 1
@@ -199,13 +237,15 @@ apt_key_fingerprints() {
 _apt_installed_keyring_matches() {
     local keyring="$1" list="$2" copy rc
     copy="$(_apt_keyring_copy "$keyring")" || return 1
+    _apt_tmp_register "$copy"
     apt_keyring_matches "$copy" "$list"; rc=$?
     rm -f "$copy"
     return "$rc"
 }
 
 # _apt_keyring_copy <keyring> — print the path of a private temporary copy of
-# a root-owned keyring, readable by the invoking user. Caller removes it.
+# a root-owned keyring, readable by the invoking user. The caller removes it,
+# and registers it (_apt_tmp_register) for the run that is interrupted first.
 _apt_keyring_copy() {
     local copy
     copy="$(mktemp)" || return 1
@@ -646,6 +686,7 @@ apt_add_repo() {
         # in place: nothing unchecked ever lands in the keyring directory.
         local key_tmp
         key_tmp="$(mktemp)" || return 2
+        _apt_tmp_register "$key_tmp"
         if ! wget -qO "$key_tmp" "$key_url"; then
             log_error "Failed to fetch the signing key for '${name}' from ${key_url}"
             rm -f "$key_tmp"
@@ -677,6 +718,7 @@ apt_add_repo() {
         if [[ -z "$landed" ]] && copy="$(_apt_keyring_copy "$keyring")"; then
             # --no-fingerprint: accept whatever primary keys it holds, but it
             # must hold at least one.
+            _apt_tmp_register "$copy"
             landed="$(apt_key_fingerprints "$copy" | paste -sd, - || true)"
             rm -f "$copy"
         fi

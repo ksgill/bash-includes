@@ -352,10 +352,6 @@ log_check()   { _log "$_LOG_CYN" "CHECK"   1 "$@"; }
 log_warn()    { _log "$_LOG_YEL" "WARN"    2 "$@"; }
 log_error()   { _log "$_LOG_RED" "ERROR"   2 "$@"; }
 
-# log_warning is an alias kept for openvpn-bld.sh, which used that spelling.
-# Prefer log_warn in new code; this will be dropped after the call sites migrate.
-log_warning() { log_warn "$@"; }
-
 die() { log_error "$*"; exit 1; }
 
 # ── section <title> ───────────────────────────────────────────────────────────

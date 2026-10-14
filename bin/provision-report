@@ -49,9 +49,9 @@ earlier run's record of a file a later run changed or deleted shows
 SUPERSEDED, not CHANGED or MISSING.
 
 Hashes are recorded, and re-checked, only for content anyone on the machine
-can read: other-read on the file and other-execute on every ancestor
-directory. Private keys, 0600 configs and anything under a 0700 directory are
-tracked by presence alone (PRESENT / MISSING).
+can read: group- and other-read on the file, group- and other-execute on
+every ancestor directory. Private keys, 0600 configs and anything under a
+0700 directory are tracked by presence alone (PRESENT / MISSING).
 
 With --verify, a record that names a backup shows whether the backup is still
 there, on its "backup:" line: [present], [missing], or [unknown] (existence
@@ -129,8 +129,9 @@ jget() {
 # because this command is deliberately standalone: it runs on machines that
 # have the built installers but no bash-includes checkout. See journal.sh for
 # the full reasoning; in short:
-#   - world-readable content only: other-read on the canonical file and
-#     other-execute on each canonical ancestor; symlinks are resolved
+#   - world-readable content only: group- and other-read on the canonical
+#     file and group- and other-execute on each canonical ancestor (mode
+#     bits only, ACLs are not consulted); symlinks are resolved
 #     (`realpath -e`) and the rule applies to what they point at. No sudo;
 #   - absolute paths only, so a bare target name is never resolved against the
 #     working directory, where a planted symlink could redirect it;
@@ -163,9 +164,9 @@ file_sha256() {
     for m in "${modes[@]}"; do
         [[ "$m" =~ ^[0-7]{3,4}$ ]] || return 1
     done
-    (( (8#${modes[0]} & 8#4) != 0 )) || return 1
+    (( (8#${modes[0]} & 8#44) == 8#44 )) || return 1
     for m in "${modes[@]:1}"; do
-        (( (8#$m & 8#1) != 0 )) || return 1
+        (( (8#$m & 8#11) == 8#11 )) || return 1
     done
     out="$(set -o pipefail
            timeout -k 2 "$HASH_TIMEOUT" dd if="$c" iflag=nofollow,nonblock status=none 2>/dev/null \
@@ -221,11 +222,23 @@ path_state() {
     fi
     if [[ "$SUDO_USABLE" != yes ]]; then
         PATH_STATE=unknown
-    elif sudo -n test -e "$f" 2>/dev/null; then
-        PATH_STATE=present
-    else
-        PATH_STATE=absent
+        return 0
     fi
+    # Under the hash timeout: an unresponsive automount or a stale NFS target
+    # would otherwise hang the whole report. Root answers in words, as
+    # backup.sh's _backup_exists does: a bare exit status of 1 could as well
+    # be sudo refusing (a lapsed timestamp, a policy without `test`), which
+    # must not read as a missing file. Anything but yes or no — the timeout's
+    # 124 and 137 among them — is no answer.
+    local answer
+    # Deliberate: $1 is for the inner shell, not this one.
+    # shellcheck disable=SC2016
+    answer="$(timeout -k 2 "$HASH_TIMEOUT" sudo -n sh -c 'if test -e "$1"; then echo yes; else echo no; fi' sh "$f" 2>/dev/null)" || answer=""
+    case "$answer" in
+        yes) PATH_STATE=present ;;
+        no)  PATH_STATE=absent ;;
+        *)   PATH_STATE=unknown ;;
+    esac
 }
 
 # ── path_key <path> ───────────────────────────────────────────────────────────

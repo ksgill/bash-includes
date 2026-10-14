@@ -155,9 +155,11 @@ _json_escape() {
 # Policy: the journal is mode 0644, so a hash in it is published to every local
 # account — and a hash is a confirmation oracle for anyone holding a candidate
 # content. So a hash is recorded only for content that is world-readable
-# already: the file has the other-read bit AND every ancestor directory has the
-# other-execute bit. A 0600 key never gets one; neither does a 0644 file inside
-# a 0700 directory (~/.ssh/config, /etc/wireguard/*). The record is still
+# already: the file has the group- and other-read bits AND every ancestor
+# directory has the group- and other-execute bits (a 0604 file shuts out its
+# owning group, since the group class is checked before other). A 0600 key
+# never gets one; neither does a 0644 file inside a 0700 directory
+# (~/.ssh/config, /etc/wireguard/*). The record is still
 # written, without sha256_after. Nothing here uses sudo: a file that fails the
 # rule is not worth escalating for, and one that passes it is readable as-is.
 #
@@ -222,9 +224,12 @@ _sha256_of() {
     for m in "${modes[@]}"; do
         [[ "$m" =~ ^[0-7]{3,4}$ ]] || return 1
     done
-    (( (8#${modes[0]} & 8#4) != 0 )) || return 1
+    # Group and other, both: the group class is checked before other, so a
+    # 0604 file or a 0705 directory shuts out the owning group. 8#44 and
+    # 8#11 are the read and search bits of the two classes.
+    (( (8#${modes[0]} & 8#44) == 8#44 )) || return 1
     for m in "${modes[@]:1}"; do
-        (( (8#$m & 8#1) != 0 )) || return 1
+        (( (8#$m & 8#11) == 8#11 )) || return 1
     done
 
     out="$(set -o pipefail
@@ -244,11 +249,19 @@ _sha256_of() {
 # backup.sh to attach the backup path, for instance.
 #
 # When <target> is an absolute path to a file whose content is world-readable
-# (other-read on the file, other-execute on every ancestor directory), its
-# sha256 is recorded as sha256_after. Any other file is recorded without one —
-# the journal is world-readable, and a hash would publish a confirmation oracle
-# for content that is not. Use journal_record_nohash to leave the hash out of a
-# world-readable file's record as well.
+# (group- and other-read on the file, group- and other-execute on every
+# ancestor directory), its sha256 is recorded as sha256_after. Any other file
+# is recorded without one — the journal is world-readable, and a hash would
+# publish a confirmation oracle for content that is not. Use
+# journal_record_nohash to leave the hash out of a world-readable file's
+# record as well.
+#
+# The rule is applied when the record is written, so call this after the
+# file's final chmod. A file created under umask 022 and journalled before
+# its `chmod 600` has its hash recorded, and the journal keeps it.
+#
+# Mode bits only: a named-user ACL entry that denies one account is not
+# seen, so do not rely on the rule for a path that carries an access ACL.
 #
 # Never fatal. A full disk or a read-only /var must not abort a provisioning
 # run partway through; a missing journal line is the lesser loss.

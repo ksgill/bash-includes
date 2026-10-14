@@ -211,6 +211,105 @@ _backup_dir_owner() {
 # Fatal on failure by design: proceeding to modify a file whose backup failed is
 # exactly the situation the convention exists to prevent. That includes not
 # being able to ask root whether a file it alone can see is there.
+#
+# _backup_chain <dir> — set the array BACKUP_CHAIN to <dir> and every
+# ancestor, root first. An array, not lines: a component may hold a newline.
+_backup_chain() {
+    local rest part acc=""
+    BACKUP_CHAIN=("/")
+    rest="${1#/}"
+    while [[ -n "$rest" ]]; do
+        part="${rest%%/*}"
+        acc+="/${part}"
+        BACKUP_CHAIN+=("$acc")
+        if [[ "$rest" == */* ]]; then
+            rest="${rest#*/}"
+        else
+            rest=""
+        fi
+    done
+}
+
+# _backup_dir_closed <file> — can the backup be written beside <file> without
+# another account getting a hand in? The file's directory, resolved to its
+# canonical path, and every ancestor of that must be a real directory owned
+# by root or the invoking user and not writable by group or other. The one
+# exception is the shape /tmp has: sticky AND world-writable, with
+# fs.protected_symlinks and fs.protected_regular on. Only then does the
+# kernel refuse root a link or a regular file someone else planted there
+# (may_follow_link and may_create_in_sticky apply to directories that are
+# both sticky and other-writable; a 1775 directory gets no protection), and
+# only the owner of an entry can rename or remove it. Anything less, and an
+# account that can write the directory could swap the private copy for a
+# link, or for a file of its own, while cp writes it — the window the
+# copy-then-rename below narrows but, with uutils cp, does not close.
+#
+# On success prints the canonical directory, and the caller writes there:
+# the literal path may pass through a symlink in a directory someone else
+# can write, and that link could be repointed between this check and the
+# copy. On refusal prints the reason and returns 1; a component that cannot
+# be examined, as the user or through sudo, is a refusal too. Nothing is
+# created and nothing is changed.
+_backup_dir_closed() {
+    local f="$1" dir c line uid shown kind perm me
+    local -a BACKUP_CHAIN=()
+    if [[ "$f" == */* ]]; then
+        dir="${f%/*}"
+        dir="${dir:-/}"
+    else
+        dir="."
+    fi
+    dir="$(realpath -e -- "$dir" 2>/dev/null)" \
+        || dir="$(sudo realpath -e -- "$dir" 2>/dev/null)" \
+        || { printf 'the directory of %s cannot be resolved\n' "$f"; return 1; }
+    me="$(id -u)"
+    _backup_chain "$dir"
+    for c in "${BACKUP_CHAIN[@]}"; do
+        line="$(stat -c '%u %a %f' -- "$c" 2>/dev/null)" \
+            || line="$(sudo stat -c '%u %a %f' -- "$c" 2>/dev/null)" \
+            || { printf '%s cannot be examined\n' "$c"; return 1; }
+        read -r uid shown kind <<< "$line"
+        # %f is the raw st_mode in hex: the type in the top nibble (S_IFDIR
+        # is 0x4000), the permission and special bits in the low twelve.
+        # The bits are taken from here; %a is only for the message.
+        perm=$(( 16#${kind:-0} & 8#7777 ))
+        if (( (16#${kind:-0} & 16#F000) != 16#4000 )); then
+            printf '%s is not a directory\n' "$c"
+            return 1
+        fi
+        if [[ "$uid" != 0 && "$uid" != "$me" ]]; then
+            printf '%s is owned by someone else (uid %s)\n' "$c" "$uid"
+            return 1
+        fi
+        if (( perm & 8#22 )); then
+            # Sticky and other-writable, both, is what the kernel protects.
+            if (( (perm & 8#1002) == 8#1002 )) \
+               && [[ "$(cat /proc/sys/fs/protected_symlinks 2>/dev/null)" == 1 ]] \
+               && [[ "$(cat /proc/sys/fs/protected_regular 2>/dev/null)" =~ ^[1-9] ]]; then
+                continue
+            fi
+            printf '%s is writable by group or other (mode %s) and not a sticky, world-writable directory with protected symlinks and regular files\n' "$c" "$shown"
+            return 1
+        fi
+    done
+    printf '%s\n' "$dir"
+    return 0
+}
+
+# The copy is written under a private name beside the backup and renamed over
+# it (see the body). A run interrupted between the two leaves that file
+# behind; with cleanup.sh loaded it is removed at exit. backup_file run in a
+# subshell, as apt.sh does, registers nothing the parent can see: there the
+# window, the length of one cp, is accepted.
+_BACKUP_TMP=""
+_BACKUP_TMP_HANDLER=""
+_backup_tmp_cleanup() {
+    [[ -n "$_BACKUP_TMP" ]] || return 0
+    # -n: a handler must never wait at a password prompt.
+    sudo -n rm -f -- "$_BACKUP_TMP" 2>/dev/null \
+        || log_warn "backup: temporary file ${_BACKUP_TMP} was left behind"
+    _BACKUP_TMP=""
+}
 backup_file() {
     local f="$1" reason="${2:-before modification}" dest kind rc=0
 
@@ -224,18 +323,24 @@ backup_file() {
             die "Could not find out whether ${f} exists (it is in a directory only root can search, and sudo gave no answer) — refusing to go on: it would be modified without a backup" ;;
     esac
 
-    dest="${f}.bak"
+    # Where the backup goes: beside the file, in the canonical form of its
+    # directory, and only if nobody but root or the invoking user can write
+    # there (_backup_dir_closed). The reason comes back in place of the path.
+    local canon
+    canon="$(_backup_dir_closed "$f")" \
+        || die "Could not back up ${f}: ${canon} — another account could redirect the backup; refusing to modify it"
+    dest="${canon}/${f##*/}.bak"
     kind="previous version"
     if _is_pristine_maintainer_file "$f"; then
         rc=0
-        _backup_exists -e "${f}.orig" || rc=$?
+        _backup_exists -e "${canon}/${f##*/}.orig" || rc=$?
         case "$rc" in
             0) ;;
             1)
-                dest="${f}.orig"
+                dest="${canon}/${f##*/}.orig"
                 kind="pristine maintainer version" ;;
             *)
-                die "Could not find out whether ${f}.orig exists (sudo gave no answer) — refusing to go on: it might be overwritten" ;;
+                die "Could not find out whether ${dest%.bak}.orig exists (sudo gave no answer) — refusing to go on: it might be overwritten" ;;
         esac
     fi
 
@@ -244,16 +349,49 @@ backup_file() {
     # mtime so you can tell when the file was actually shipped. -L copies what
     # a symlink points to (-a alone would copy the link).
     #
-    # The backup lands at exactly ${dest} or not at all:
-    # --remove-destination replaces a file or a link that is there instead of
-    # writing through it, and -T treats ${dest} as the file to create, never
-    # as a directory to copy into — without it a .bak that is a directory, or
-    # a link to one, would receive the copy inside it. With both, GNU cp
-    # replaces a link (to anything) and refuses a real directory; an
-    # implementation that refuses the link as well fails the same safe way.
-    # Either failure is fatal below, like any other failed copy.
-    sudo cp -a -L --remove-destination -T -- "$f" "$dest" \
-        || die "Could not back up ${f} to ${dest} — refusing to modify it"
+    # The copy is written under a private name beside ${dest}, then renamed
+    # over it, so the backup lands at exactly ${dest} or not at all and
+    # nothing is ever written through that name. rename replaces a file or a
+    # link that is there and never follows it; with -T, mv refuses a
+    # directory instead of moving the copy inside it. So a .bak that is a
+    # directory fails, as does, with uutils mv, a link to one (GNU mv replaces
+    # the link): both are fatal below.
+    #
+    # What this is for, stated exactly. Writing straight to ${dest} with
+    # --remove-destination is safe with GNU cp, which recreates the file
+    # with O_EXCL, and not with uutils cp, which recreates it with O_TRUNC
+    # and so writes through a link planted at ${dest} between its unlink
+    # and its open (both traced with strace: coreutils 9.5, rust-coreutils
+    # 0.10.0). ${dest} is a name anyone can predict from the file's. The
+    # private name narrows that window to one cp under a name that has to
+    # be read from a directory listing first; with GNU cp the window is
+    # closed (O_EXCL on the recreate), with uutils cp it is not. What closes
+    # it for both is _backup_dir_closed above: the race needs a directory a
+    # less-trusted account can write, and such a directory is refused
+    # before anything is written. The copy keeps the source's mode, owner
+    # and timestamps through the rename; mktemp's 0600 is replaced by -a.
+    # The private name is nine characters longer than the backup's, so a
+    # basename within nine of NAME_MAX fails here where it used to succeed.
+    local tmp
+    # The handler first, so an interrupt during mktemp itself finds it in
+    # place; _BACKUP_TMP is empty until the name is known.
+    if [[ -z "$_BACKUP_TMP_HANDLER" ]] && declare -f cleanup_push >/dev/null 2>&1; then
+        cleanup_push _backup_tmp_cleanup
+        _BACKUP_TMP_HANDLER=1
+    fi
+    tmp="$(sudo mktemp -- "${dest}.XXXXXXXX")" \
+        || die "Could not create a temporary file beside ${dest} — refusing to modify ${f}"
+    _BACKUP_TMP="$tmp"
+    # The source by its canonical directory too: a link higher up the
+    # literal path could otherwise be repointed to choose what gets copied.
+    # -L still follows the file itself when it is a link, as intended.
+    if ! sudo cp -a -L --remove-destination -T -- "${canon}/${f##*/}" "$tmp" \
+            || ! sudo mv -f -T -- "$tmp" "$dest"; then
+        sudo rm -f -- "$tmp"
+        _BACKUP_TMP=""
+        die "Could not back up ${f} to ${dest} — refusing to modify it"
+    fi
+    _BACKUP_TMP=""
 
     log_info "Backed up ${f} → ${dest} (${kind})"
 

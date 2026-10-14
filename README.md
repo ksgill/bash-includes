@@ -69,17 +69,29 @@ be replaced with no backup. Exactly what that covers:
 
 A symlink is backed up as the file it points to: the backup is a copy of the
 content with the target's mode, owner and timestamps, not a second link to
-the same target. The copy is written at the backup's own path or not at all:
-a file or link already there is replaced, never written through, and if that
-path is a directory the copy fails and `backup_file` dies rather than place
-the backup inside it.
+the same target. The copy is written under a private name beside the backup
+(`<file>.bak.XXXXXXXX`) and renamed into place, so it lands at the backup's
+own path or not at all: a file or link already there is replaced, never
+written through, and if that path is a directory the rename fails and
+`backup_file` dies rather than place the backup inside it. The file's
+directory, in its canonical form (the backup is written there, not through
+a link that someone else could repoint), and every ancestor of it must be
+owned by root or the invoking user and closed to group and other; the one
+exception is a directory shaped like `/tmp`, sticky and world-writable with
+`fs.protected_symlinks` and `fs.protected_regular` on, which is what the
+kernel actually protects. Otherwise `backup_file` dies, since an account
+that can write the directory could redirect the copy while it is written. A run
+interrupted between the copy and the rename leaves the private file behind;
+with `cleanup.sh` loaded it is removed at exit.
 
 **Persistent changes are journalled** to `/var/lib/provision/changes.jsonl` —
 state, not logs, so it survives log rotation. Run transcripts go to
 `/var/lib/provision/log/<script-name>/` (see below). The journal records paths, hashes and
 descriptions; never file contents, because callers handle private keys. The
 system journal is world-readable, so a hash is recorded only for content that
-already is: other-read on the file and other-execute on every ancestor directory. A
+already is: group- and other-read on the file and group- and other-execute on every
+ancestor directory (mode bits only; ACLs are not consulted). Journal a file after its
+final `chmod`, since the rule is applied when the record is written. A
 private key, a 0600 config or anything under a 0700 directory is journalled
 without a hash, and `provision-report --verify` tracks it by presence alone.
 `journal_record_nohash` leaves the hash out of a world-readable file's record
@@ -89,7 +101,7 @@ to keep its journal under `~/.local/state` instead; the journal uses `sudo`
 only when the invoking user cannot write where it lives, so nothing under
 `$HOME` ends up root-owned. The same hashing rule applies there: with a 0750
 home directory (Ubuntu's default since 24.04), files under `$HOME` fail the
-other-execute test and are tracked by presence only.
+ancestor test and are tracked by presence only.
 
 **APT signing keys are pinned by the caller.** `apt_add_repo` requires either
 `--fingerprint <FPR>[,<FPR>...]` or an explicit `--no-fingerprint` (since
@@ -401,6 +413,74 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.9.0
+
+One removal from the public API, one change to what the journal hashes, and
+hardening a consumer sees only as fewer ways for a run to go wrong.
+
+- **`log_warning` is removed.** It was an alias for `log_warn`, kept for
+  openvpn-bld's old spelling, and no consumer calls it any more. A script
+  that still does fails with `log_warning: command not found`; rename the
+  call to `log_warn`.
+- **The journal hashes only content every account can read.** The rule was
+  other-read on the file and other-execute on every ancestor directory. It is
+  now group- and other-read on the file and group- and other-execute on every
+  ancestor: the group class is checked before other, so a 0604 file or a 0705
+  directory shuts out the owning group. Mode bits only; an access ACL is not
+  consulted. Such a file is journalled without `sha256_after` and tracked by
+  presence, and a record an earlier release wrote for one reports NOREAD
+  under `provision-report --verify`. No fleet caller journals such a path.
+  The rule is applied when the record is written, so journal a file after its
+  final `chmod` (now said in `journal_record`'s header).
+- **`provision-report --verify` cannot hang on a path root must be asked
+  about.** The `sudo -n test -e` for a file the invoking user cannot see runs
+  under the hash timeout; an unresponsive automount or a stale NFS target
+  makes the path NOREAD instead of stopping the report.
+- **`backup_file` writes the copy under a private name and renames it into
+  place.** Nothing is written through the backup's own name any more. With
+  uutils `cp` (rust-coreutils, installed beside GNU coreutils on Ubuntu
+  26.04, which links `cp` to GNU today) `--remove-destination` reopens the
+  destination without `O_EXCL`, so a link planted at `<file>.bak` between
+  its unlink and its open would have been written through as root; GNU cp
+  recreates with `O_EXCL` and was not affected. The private name narrows
+  that window for uutils cp (one `cp`, under a name that has to be read from
+  a directory listing first) and GNU cp closes it; what closes it for both
+  is a new rule: **the file's directory, resolved to its canonical path,
+  and every ancestor must be owned by root or the invoking user and not
+  writable by group or other**; the one exception is a directory like
+  `/tmp`, sticky and world-writable with `fs.protected_symlinks` and
+  `fs.protected_regular` on (a sticky directory that only its group can
+  write gets no kernel protection and is refused). Any other directory is
+  refused before anything is written, with the reason, and the backup is
+  written by the canonical path, so a link in the literal path cannot be
+  repointed after the check. No fleet caller backs up into a refused
+  directory (every call site was checked: root-owned 0755/0700 system
+  directories, or the invoking user's own home). What a caller sees is
+  otherwise unchanged: the backup
+  lands at exactly its path or `backup_file` dies, a file or link already
+  there is replaced, a directory is refused, and with uutils `mv` so is a
+  link to one. A run interrupted between the copy and the rename leaves
+  `<file>.bak.XXXXXXXX` beside the backup; with `cleanup.sh` loaded it is
+  removed at exit. The private name is nine characters longer than `.bak`,
+  so a file whose name is within nine characters of the 255 limit can no
+  longer be backed up.
+- **`provision-report --verify` asks root for a yes or no.** The root
+  existence probe for a file the invoking user cannot see used `test -e`'s
+  exit status, where a 1 from `sudo` itself (a lapsed timestamp, a policy
+  without `test`) read as MISSING. Root now answers in words, as
+  `backup_file` already had it do; anything but yes or no is NOREAD.
+- **`apt.sh` leaves no temporary file behind on an interrupt.** The fetched
+  key and the readable copy of an installed keyring are registered with
+  `cleanup.sh` when it is loaded; `apt_key_fingerprints` removes its
+  throwaway GNUPGHOME from inside the subshell that runs gpg, so a Ctrl-C
+  during gpg removes it as well.
+- **Tests.** The three status-2 paths of `apt_add_repo` that had none (a
+  keyring that cannot be moved aside, a keyring directory that cannot be
+  created, a sources file that cannot be removed after a failed validation)
+  have one. Seven negated assertions that could not fail (`! cmd` on any line
+  but a test's last is ignored by `set -e`; shellcheck SC2314) are `run !`
+  or `[[ ! … ]]` now.
 
 ## Changes in v1.8.0
 

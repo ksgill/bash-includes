@@ -214,12 +214,15 @@ print(json.loads(open('${JOURNAL_FILE}').readline())['sha256_after'], end='')
     printf 'g\n' > "${TMP}/pub/grp";      chmod 0640 "${TMP}/pub/grp"
     printf 'b\n' > "${TMP}/priv/b.conf";  chmod 0644 "${TMP}/priv/b.conf"
     printf 'c\n' > "${TMP}/xonly/c.conf"; chmod 0644 "${TMP}/xonly/c.conf"
+    mkdir -m 0705 "${TMP}/nogrp"
+    printf 'd\n' > "${TMP}/pub/nogrp";    chmod 0604 "${TMP}/pub/nogrp"
+    printf 'e\n' > "${TMP}/nogrp/e.conf"; chmod 0644 "${TMP}/nogrp/e.conf"
     ln -s "${TMP}/priv/b.conf" "${TMP}/pub/link-to-priv"
     ln -s "${TMP}/pub/a.conf" "${TMP}/priv/link-to-pub"
     journal_init "test" "v1"
     local t
     for t in pub/a.conf pub/key pub/grp priv/b.conf xonly/c.conf \
-             pub/link-to-priv priv/link-to-pub; do
+             pub/link-to-priv priv/link-to-pub pub/nogrp nogrp/e.conf; do
         journal_record modify "${TMP}/${t}" "$t"
     done
     _journal_valid_json
@@ -241,6 +244,8 @@ for l in open(os.environ['JOURNAL_FILE']):
     [ "${lines[4]}" = "xonly/c.conf ${want_c}" ]       # 0711 dir: search is enough
     [ "${lines[5]}" = "pub/link-to-priv -" ]           # rule applies to the target
     [ "${lines[6]}" = "priv/link-to-pub ${want_a}" ]   # ...whichever way round
+    [ "${lines[7]}" = "pub/nogrp -" ]                  # 0604 shuts out the group
+    [ "${lines[8]}" = "nogrp/e.conf -" ]               # 0705 ancestor likewise
 }
 
 @test "journal_record_nohash records the change without a hash" {
@@ -676,6 +681,8 @@ _locked_dir_own() {
     [[ "$output" == *"Could not back up ${TMP}/real.conf"* ]]
     [[ "$output" != *"went on"* ]]
     [ "$(find "${TMP}/real.conf.bak" -mindepth 1 | wc -l)" -eq 0 ]
+    # The copy that could not be renamed over the directory is gone too.
+    [ "$(find "$TMP" -maxdepth 1 -name 'real.conf.bak.*' | wc -l)" -eq 0 ]
 }
 
 @test "the owner of an unsearchable ancestor is that of the directory a link points to" {
@@ -702,6 +709,158 @@ _locked_dir_own() {
     [ ! -L "${TMP}/real.conf.bak" ]
     [ "$(cat "${TMP}/real.conf.bak")" = "current" ]
     [ "$(cat "${TMP}/elsewhere")" = "unrelated" ]
+    [ "$(find "$TMP" -maxdepth 1 -name 'real.conf.bak.*' | wc -l)" -eq 0 ]
+}
+
+@test "backup_file copies under a private name beside the backup, and leaves none behind when the copy fails" {
+    [[ "$EUID" -eq 0 ]] && skip "root can read anything"
+    journal_init "test" "v1"
+    # The private name is what cp writes to: it is what mktemp made, beside
+    # the backup, and gone once renamed into place.
+    printf 'current\n' > "${TMP}/p.conf"
+    chmod 0640 "${TMP}/p.conf"
+    local seen=""
+    # shellcheck disable=SC2317
+    cp() { seen="$*"; command cp "$@"; }
+    backup_file "${TMP}/p.conf"
+    unset -f cp
+    [[ "$seen" == *"${TMP}/p.conf ${TMP}/p.conf.bak."* ]]
+    [[ "$seen" != *" ${TMP}/p.conf.bak" ]]
+    [ "$(cat "${TMP}/p.conf.bak")" = "current" ]
+    [ "$(stat -c %a "${TMP}/p.conf.bak")" = "640" ]
+    [ "$(find "$TMP" -maxdepth 1 -name 'p.conf.bak.*' | wc -l)" -eq 0 ]
+
+    # A copy that fails: the source cannot be read. No .bak, no leftover, and
+    # the caller does not go on.
+    printf 'secret\n' > "${TMP}/q.conf"
+    chmod 0000 "${TMP}/q.conf"
+    _then() { backup_file "$@"; echo "went on"; }
+    run _then "${TMP}/q.conf"
+    chmod 0644 "${TMP}/q.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not back up ${TMP}/q.conf"* ]]
+    [[ "$output" != *"went on"* ]]
+    [ ! -e "${TMP}/q.conf.bak" ]
+    [ "$(find "$TMP" -maxdepth 1 -name 'q.conf.bak*' | wc -l)" -eq 0 ]
+}
+
+@test "backup_file refuses a directory another account can write, and accepts a closed or sticky one" {
+    journal_init "test" "v1"
+    # The test tree itself passes: 0755, the invoking user's, under /tmp
+    # (sticky, with protected symlinks on every host here).
+    # On success it names the directory the backup goes into.
+    run _backup_dir_closed "${TMP}/x.conf"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TMP" ]
+
+    # Group-writable, not sticky: anyone in the group could swap the copy.
+    mkdir -m 0775 "${TMP}/open"
+    printf 'v\n' > "${TMP}/open/a.conf"
+    run _backup_dir_closed "${TMP}/open/a.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == "${TMP}/open is writable by group or other (mode 775)"* ]]
+    _then() { backup_file "$@"; echo "went on"; }
+    run _then "${TMP}/open/a.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not back up ${TMP}/open/a.conf: ${TMP}/open is writable by group or other"* ]]
+    [[ "$output" != *"went on"* ]]
+    [ ! -e "${TMP}/open/a.conf.bak" ]
+    [ "$(find "${TMP}/open" -name 'a.conf.bak*' | wc -l)" -eq 0 ]
+    # Nothing was journalled for it.
+    [[ "$(cat "$JOURNAL_FILE" 2>/dev/null)" != *"open/a.conf"* ]]
+
+    # Other-writable, same.
+    chmod 0757 "${TMP}/open"
+    run _backup_dir_closed "${TMP}/open/a.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"(mode 757)"* ]]
+
+    # Sticky but only group-writable: the kernel protects nothing there.
+    chmod 1775 "${TMP}/open"
+    run _backup_dir_closed "${TMP}/open/a.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"(mode 1775)"* ]]
+
+    # Sticky and world-writable (what /tmp is): accepted exactly when the
+    # kernel keeps root from following someone else's link there, or from
+    # opening someone else's file.
+    chmod 1777 "${TMP}/open"
+    run _backup_dir_closed "${TMP}/open/a.conf"
+    if [[ "$(cat /proc/sys/fs/protected_symlinks)" == 1 \
+          && "$(cat /proc/sys/fs/protected_regular)" != 0 ]]; then
+        [ "$status" -eq 0 ]
+        backup_file "${TMP}/open/a.conf"
+        [ "$(cat "${TMP}/open/a.conf.bak")" = "v" ]
+    else
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"not a sticky, world-writable directory"* ]]
+    fi
+
+    # The rule looks at every ancestor, not only the file's own directory.
+    mkdir -m 0755 "${TMP}/open/deeper"
+    chmod 0775 "${TMP}/open"
+    printf 'w\n' > "${TMP}/open/deeper/b.conf"
+    run _backup_dir_closed "${TMP}/open/deeper/b.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == "${TMP}/open is writable"* ]]
+    chmod 0755 "${TMP}/open"
+    run _backup_dir_closed "${TMP}/open/deeper/b.conf"
+    [ "$status" -eq 0 ]
+    # A directory owned by a third account cannot be made without root; that
+    # branch is covered by reading only.
+}
+
+@test "backup_file writes beside the canonical directory, not through a link someone else could repoint" {
+    journal_init "test" "v1"
+    # A link in an open directory points at a closed one. The rule judges
+    # the closed target, and the backup is written there by its canonical
+    # path, so repointing the link after the check changes nothing.
+    mkdir -m 0755 "${TMP}/closed"
+    mkdir -m 0777 "${TMP}/open"
+    ln -s ../closed "${TMP}/open/link"
+    printf 'c\n' > "${TMP}/closed/f.conf"
+    run _backup_dir_closed "${TMP}/open/link/f.conf"
+    [ "$status" -eq 0 ]
+    [ "$output" = "${TMP}/closed" ]
+    local seen=""
+    # shellcheck disable=SC2317
+    mv() { seen="$*"; command mv "$@"; }
+    backup_file "${TMP}/open/link/f.conf"
+    unset -f mv
+    [[ "$seen" == *" ${TMP}/closed/f.conf.bak" ]]
+    [[ "$seen" != *"open/link"* ]]
+    [ "$(cat "${TMP}/closed/f.conf.bak")" = "c" ]
+    grep -q "\"backup\":\"${TMP}/closed/f.conf.bak\"" "$JOURNAL_FILE"
+    # A file in the open directory itself is still refused.
+    printf 'o\n' > "${TMP}/open/g.conf"
+    _then() { backup_file "$@"; echo "went on"; }
+    run _then "${TMP}/open/g.conf"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"${TMP}/open is writable by group or other (mode 777)"* ]]
+    [[ "$output" != *"went on"* ]]
+}
+
+@test "backup_file registers its temporary file for removal at exit, once, and the handler removes it" {
+    journal_init "test" "v1"
+    # cleanup.sh is not sourced in this process (see setup); a stand-in
+    # records what the library would have registered.
+    local -a pushed=()
+    # shellcheck disable=SC2317
+    cleanup_push() { pushed+=("$*"); }
+    printf 'a\n' > "${TMP}/r.conf"
+    backup_file "${TMP}/r.conf"
+    backup_file "${TMP}/r.conf"
+    [ "${#pushed[@]}" -eq 1 ]
+    [ "${pushed[0]}" = "_backup_tmp_cleanup" ]
+    # Nothing to do after a copy that completed...
+    [ -z "$_BACKUP_TMP" ]
+    _backup_tmp_cleanup
+    # ...and a copy interrupted before the rename is removed by the handler.
+    : > "${TMP}/r.conf.bak.LEFT0VER"
+    _BACKUP_TMP="${TMP}/r.conf.bak.LEFT0VER"
+    _backup_tmp_cleanup
+    [ ! -e "${TMP}/r.conf.bak.LEFT0VER" ]
+    [ -z "$_BACKUP_TMP" ]
 }
 
 @test "backup_file never overwrites a .orig it cannot see" {
@@ -1965,6 +2124,129 @@ STUB
     [ "$(_calls | wc -l)" -eq 0 ]
 }
 
+# _sudo_fails <command> — the sudo stand-in refuses that one command (by its
+# first word) and runs every other as setup's does.
+_sudo_fails() {
+    SUDO_FAILS="$1"
+    # shellcheck disable=SC2317
+    sudo() {
+        case "${1:-}" in -v|-n) shift ;; esac
+        [[ $# -eq 0 ]] && return 0
+        [[ "$1" == "$SUDO_FAILS" ]] && return 1
+        "$@"
+    }
+}
+
+@test "apt_add_repo returns 2 when a mismatched keyring cannot be moved aside, and leaves it in place" {
+    _apt_env; WGET_SERVES=a.asc
+    mkdir -p "$APT_KEYRING_DIR"
+    cp "${APTKEYS}/b.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+    _sudo_fails mv
+    _try() { local rc=0; ( _add "$@" ) || rc=$?; echo "status ${rc}"; }
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"could not move the unpinned keyring"* ]]
+    [[ "$output" == *"status 2"* ]]
+    # The keyring apt trusts is the one that was there, and nothing else
+    # happened: no key fetched, no sources file.
+    [ "$(apt_key_fingerprints "${APT_KEYRING_DIR}/fixture.gpg")" = "$FPR_B" ]
+    [ -z "$(ls "${APT_KEYRING_DIR}"/fixture.gpg.untrusted.* 2>/dev/null)" ]
+    [ ! -e "$WGET_CALLED" ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+}
+
+@test "apt_add_repo returns 2 when the keyring directory cannot be created" {
+    _apt_env; WGET_SERVES=a.asc
+    [ ! -d "$APT_KEYRING_DIR" ]
+    _sudo_fails mkdir
+    _try() { local rc=0; ( _add "$@" ) || rc=$?; echo "status ${rc}"; }
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"could not create ${APT_KEYRING_DIR}"* ]]
+    [[ "$output" == *"status 2"* ]]
+    [ ! -d "$APT_KEYRING_DIR" ]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_add_repo returns 2, not 1, when the sources file of a failed validation cannot be removed" {
+    _apt_env; WGET_SERVES=a.asc
+    : > "${APT_STUB}/validate-fail"
+    _sudo_fails rm
+    _try() { local rc=0; ( _add "$@" ) || rc=$?; echo "status ${rc}"; }
+    run _try --fingerprint "$FPR_A"
+    [[ "$output" == *"failed validation"* ]]
+    [[ "$output" == *"Could not remove ${APT_SOURCES_DIR}/fixture.sources"* ]]
+    # Status 1 would invite a fallback with the unvalidated repo still configured.
+    [[ "$output" == *"status 2"* ]]
+    [[ "$output" != *"status 1"* ]]
+    [ -f "${APT_SOURCES_DIR}/fixture.sources" ]
+    # Not journalled: nothing this call did is settled.
+    [[ "$(_journal)" != *"fixture.sources"* ]]
+}
+
+@test "apt_add_repo registers its temporary files for removal at exit, and each is gone when it returns" {
+    _apt_env; WGET_SERVES=a.asc
+    export TMPDIR="${TMP}/tmpdir"
+    mkdir -p "$TMPDIR"
+    local -a pushed=()
+    # shellcheck disable=SC2317
+    cleanup_push() { pushed+=("$*"); }
+    _add --fingerprint "$FPR_A"
+    # One handler, registered once, for all of them.
+    [ "${#pushed[@]}" -eq 1 ]
+    [ "${pushed[0]}" = "_apt_tmp_cleanup" ]
+    # The fetched key and the readable copy of the installed keyring were
+    # registered, in TMPDIR, and have been removed already.
+    [ "${#_APT_TMPS[@]}" -eq 2 ]
+    local t
+    for t in "${_APT_TMPS[@]}"; do
+        [[ "$t" == "${TMPDIR}/"* ]]
+        [ ! -e "$t" ]
+    done
+    [ "$(find "$TMPDIR" -mindepth 1 | wc -l)" -eq 0 ]
+    # The handler removes what an interrupted run would have left.
+    : > "${TMPDIR}/left"
+    _APT_TMPS+=("${TMPDIR}/left")
+    _apt_tmp_cleanup
+    [ ! -e "${TMPDIR}/left" ]
+    [ "${#_APT_TMPS[@]}" -eq 0 ]
+    # A second call does not register the handler again.
+    _add --fingerprint "$FPR_A"
+    [ "${#pushed[@]}" -eq 1 ]
+}
+
+@test "apt_key_fingerprints removes its GNUPGHOME when interrupted while gpg runs" {
+    _apt_env
+    export TMPDIR="${TMP}/tmpdir"
+    mkdir -p "$TMPDIR" "${TMP}/bin"
+    # A gpg that reports it started and then takes its time.
+    cat > "${TMP}/bin/gpg" <<'STUB'
+#!/usr/bin/env bash
+: > "${APT_STUB}/gpg-started"
+sleep 10
+STUB
+    chmod +x "${TMP}/bin/gpg"
+    export APT_STUB="${TMP}/aptstub"
+    mkdir -p "$APT_STUB"
+    # Not `… &`: a job a non-interactive shell starts in the background has
+    # SIGINT ignored, and a signal ignored on entry can be neither trapped
+    # nor reset, so the interrupt would never arrive and gpg would simply
+    # finish. timeout runs the command in the foreground of this test and,
+    # after one second, sends INT to its whole process group — the function's
+    # subshell and gpg alike, as Ctrl-C at a terminal does.
+    local started rc=0
+    started=$(date +%s)
+    PATH="${TMP}/bin:${PATH}" timeout -s INT 1 bash -c "
+        . '${LIB}/log.sh'; . '${LIB}/apt.sh'
+        apt_key_fingerprints '${APTKEYS}/a.asc'" >/dev/null 2>&1 || rc=$?
+    # 124: timeout fired. The stub sleeps 10 s, so a run that outlived its
+    # interrupt shows here, not as a passing test.
+    [ "$rc" -eq 124 ]
+    [ -e "${APT_STUB}/gpg-started" ]
+    [ $(( $(date +%s) - started )) -lt 5 ]
+    # The home is gone once the interrupt has been handled.
+    [ "$(find "$TMPDIR" -mindepth 1 | wc -l)" -eq 0 ]
+}
+
 # The scoped validation: what apt printed decides the status. Only "no Release
 # file for the suite" is status 1; the lines are apt's own (3.2.0), with the
 # older "GPG error" wording as well.
@@ -2532,7 +2814,7 @@ STUB
     [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 0 present"* ]]
 }
 
-@test "provision-report --verify checks a root-only file's presence through sudo -n test -e" {
+@test "provision-report --verify checks a root-only file's presence by asking root for a yes or no" {
     [[ "$EUID" -eq 0 ]] && skip "root can see anywhere"
     mkdir -m 0700 "${TMP}/rootonly"
     printf 'x\n' > "${TMP}/rootonly/kept.conf"
@@ -2551,6 +2833,8 @@ STUB
 [[ "${1:-}" == -n ]] && shift
 printf '%s\n' "$*" >> "${TMP}/sudo.calls"
 [[ -n "${SUDO_BROKEN:-}" ]] && exit 1
+# A sudo that can run `true` but refuses the probe: exit 1, no words.
+[[ -n "${SUDO_PROBE_REFUSED:-}" && "$1" != true ]] && exit 1
 chmod 0700 "${TMP}/rootonly"; rc=0; "$@" || rc=$?; chmod 0000 "${TMP}/rootonly"
 exit "$rc"
 STUB
@@ -2561,13 +2845,22 @@ STUB
         "${BIN}/provision-report" --verify
     [ "$status" -eq 0 ]
     [[ "$output" == *"0 ok, 0 changed, 1 missing, 0 unreadable, 1 present"* ]]
-    run ! grep -qv '^true$\|^test -e ' "${TMP}/sudo.calls"
+    # Root is asked in words (yes/no), the way backup.sh asks; content is
+    # never read through it.
+    run ! grep -qv '^true$\|^sh -c if test -e ' "${TMP}/sudo.calls"
     # Whether sudo can run is asked once for the whole journal, not per path.
     [ "$(grep -c '^true$' "${TMP}/sudo.calls")" -eq 1 ]
-    [ "$(grep -c '^test -e ' "${TMP}/sudo.calls")" -eq 2 ]
+    [ "$(grep -c '^sh -c if test -e ' "${TMP}/sudo.calls")" -eq 2 ]
 
     # Without a working sudo the answer is unknown, never MISSING.
     run env PATH="${TMP}/stub:$PATH" TMP="$TMP" SUDO_BROKEN=1 JOURNAL_FILE="$JOURNAL_FILE" \
+        NO_COLOR=1 "${BIN}/provision-report" --verify
+    [[ "$output" == *"0 ok, 0 changed, 0 missing, 2 unreadable, 0 present"* ]]
+
+    # A sudo that runs `true` but refuses the probe (lapsed timestamp, a
+    # policy without sh) exits 1 with no answer: NOREAD, never MISSING. The
+    # regression this guards: an exit status of 1 used to be read as "absent".
+    run env PATH="${TMP}/stub:$PATH" TMP="$TMP" SUDO_PROBE_REFUSED=1 JOURNAL_FILE="$JOURNAL_FILE" \
         NO_COLOR=1 "${BIN}/provision-report" --verify
     chmod 0700 "${TMP}/rootonly"
     [[ "$output" == *"0 ok, 0 changed, 0 missing, 2 unreadable, 0 present"* ]]
@@ -2896,8 +3189,8 @@ _row() { grep -E "  $1 +${TMP}/" <<< "$output" || true; }
 
 @test "ranges_overlap rejects disjoint ranges" {
     . "${LIB}/net.sh"
-    ! ranges_overlap 10.0.0.0  16 10.1.0.0    16
-    ! ranges_overlap 192.168.1.0 24 192.168.2.0 24
+    run ! ranges_overlap 10.0.0.0  16 10.1.0.0    16
+    run ! ranges_overlap 192.168.1.0 24 192.168.2.0 24
     ! ranges_overlap 10.8.0.0  24 172.16.0.0  16
 }
 
@@ -3232,8 +3525,8 @@ _bld_stamp() {
 
     # The marker block and its bootstrap must not survive into dist/: that is
     # what makes the artifact standalone.
-    ! grep -q '_bootstrap_lib' "${TMP}/bldrepo/dist/one.sh"
-    ! grep -q '>>> bash-includes >>>' "${TMP}/bldrepo/dist/one.sh"
+    run ! grep -q '_bootstrap_lib' "${TMP}/bldrepo/dist/one.sh"
+    run ! grep -q '>>> bash-includes >>>' "${TMP}/bldrepo/dist/one.sh"
     # ...and the library it asked for must actually be inlined.
     grep -q 'log_open_transcript()' "${TMP}/bldrepo/dist/one.sh"
 }
@@ -3359,7 +3652,7 @@ EOF
     run _git_strip_github_host_block "${TMP}/cfg"
     [ "$status" -eq 0 ]
     echo "$output" | grep -q 'Host other'
-    ! echo "$output" | grep -q 'Host github'
+    [[ "$output" != *'Host github'* ]]
     echo "$output" | grep -q 'User bob'
 }
 
@@ -3412,7 +3705,7 @@ EOF
     git_github_ssh_stanza
     # The appended copy is gone from config, the unrelated host survives, and
     # the real stanza is now the file under config.d.
-    ! grep -q 'Host github' "${HOME}/.ssh/config"
+    run ! grep -q 'Host github' "${HOME}/.ssh/config"
     grep -q 'Host other' "${HOME}/.ssh/config"
     grep -qx 'Host github' "${HOME}/.ssh/config.d/10-github.conf"
 }
@@ -3527,7 +3820,7 @@ _stub_sudo_unavailable() {
     [ "$status" -eq 0 ]
     # The regression this guards: -v authenticates despite NOPASSWD:ALL, so
     # reaching it here is a password prompt on a machine that needs none.
-    ! _sudo_calls | grep -q -- '-v'
+    [[ "$(_sudo_calls)" != *-v* ]]
     _sudo_calls | grep -q -- '-n true'
 }
 
