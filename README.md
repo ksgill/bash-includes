@@ -39,6 +39,23 @@ per command. `require_unprivileged` enforces this and fails immediately with an
 explanation if a script is run as root, instead of silently leaving root-owned
 artefacts behind.
 
+**A Ctrl-C during a `sudo` command stops the script.** `privilege.sh` defines
+a `sudo` function around the real one. With a terminal, sudo-rs (0.2.13, the
+`sudo` of Ubuntu 26.04) runs the command on its own pty and takes the
+terminal's foreground for the duration, so a Ctrl-C typed meanwhile kills the
+command and never reaches the script: sudo returns 130, no trap runs, and the
+script carries on one step short. The function takes a 130 from sudo as that
+interrupt and sends the script the SIGINT it missed, so its trap (the
+`cleanup.sh` handlers, exit 130) runs as it would for any other command.
+Limits: a command that catches SIGINT and exits with another status is not
+seen, and a command that exits 130 for its own reasons is taken for an
+interrupt; and under sudo 1.9, where the script gets the terminal's signal
+itself, a trap that does not exit runs twice. Use `command sudo` for such a
+command, and for a helper started with `&` (through the function, `$!` would
+be a subshell, not sudo). The function is not defined when a `sudo` function
+already exists, so a test stub exported before the script runs stays in
+charge.
+
 **Library files never set shell options.** `set -euo pipefail` belongs to the
 entry-point script; a library that sets it changes the behaviour of code that
 did not ask for it. Library files assume strict mode is in effect.
@@ -419,6 +436,11 @@ through.
 One removal from the public API, one change to what the journal hashes, and
 hardening a consumer sees only as fewer ways for a run to go wrong.
 
+- **`privilege.sh` defines a `sudo` function.** With a terminal, sudo-rs
+  takes the foreground, so a Ctrl-C during a `sudo` command killed the
+  command and never reached the script. A 130 from sudo now sends the script
+  the SIGINT it missed (see Conventions for the limits). Use `command sudo`
+  for a helper started with `&`.
 - **`log_warning` is removed.** It was an alias for `log_warn`, kept for
   openvpn-bld's old spelling, and no consumer calls it any more. A script
   that still does fails with `log_warning: command not found`; rename the

@@ -18,6 +18,54 @@ _LIB_PRIVILEGE_SOURCED=1
 
 _SUDO_KEEPALIVE_PID=""
 
+# ── sudo <args...> ────────────────────────────────────────────────────────────
+# A foreground `sudo cmd` interrupted from the keyboard interrupts the script
+# too.
+#
+# With a terminal, sudo-rs runs the command on a pty of its own and makes
+# itself the terminal's foreground process group for the duration. A Ctrl-C
+# typed meanwhile reaches sudo and the command and nothing else: the command
+# dies, sudo returns 130, and the script that called it never receives SIGINT.
+# Its trap does not run and it carries on with the next line, one step short.
+# (Reproduced on sudo-rs 0.2.13: `sudo sleep 4` under a script with an INT
+# trap, Ctrl-C, "rc=130", no trap, the script ran to its end.)
+#
+# So a sudo that returns 130 is taken as that interrupt, and the script is
+# sent the SIGINT it missed; what happens then is the script's own trap
+# (cleanup.sh: the handlers run, exit 130). In a subshell the subshell goes
+# too. During a teardown, where cleanup.sh ignores SIGINT, the signal is sent
+# and ignored, and the keystroke does not reach the command either.
+#
+# Under sudo 1.9 the script stays in the foreground and gets the terminal's
+# SIGINT itself, so with a trap that does not exit (a flag, a menu loop) the
+# handler runs twice: once for the terminal's signal, once for this one.
+#
+# What this cannot see: a command that catches SIGINT and exits with some
+# other status. And it cannot tell an interrupt from a command that exits 130
+# of its own accord; for one that does, or for a helper started with `&`
+# (where the function would put a subshell between the script and sudo, and
+# `$!` would be that subshell), call `command sudo`.
+#
+# Not defined when a `sudo` function already exists: a test's stub, exported
+# before the script under test is run, stays in charge.
+_SUDO_WRAPPER=""
+if ! declare -F sudo >/dev/null; then
+    sudo() {
+        local rc=0
+        command sudo "$@" || rc=$?
+        if [[ "$rc" -eq 130 ]]; then
+            # The script first: its trap is pending by the time a subshell
+            # that is in its way has gone.
+            kill -INT "$$"
+            [[ "$BASHPID" == "$$" ]] || kill -INT "$BASHPID"
+        fi
+        return "$rc"
+    }
+    # To tell later whether `sudo` is still this function or a stub defined
+    # since.
+    _SUDO_WRAPPER="$(declare -f sudo)"
+fi
+
 # ── require_unprivileged [args...] ────────────────────────────────────────────
 # Call at the top of every entry point, before any work.
 #
@@ -36,8 +84,14 @@ require_unprivileged() {
         die "Log in as your normal user and re-run it."
     fi
 
-    command -v sudo >/dev/null 2>&1 \
-        || die "sudo is required but is not installed"
+    # While the wrapper above is in place `command -v sudo` finds the
+    # function, so look for the binary. A stub that has replaced it counts as
+    # sudo, as any function did before.
+    if [[ -n "$_SUDO_WRAPPER" && "$(declare -f sudo)" == "$_SUDO_WRAPPER" ]]; then
+        type -P sudo >/dev/null 2>&1 || die "sudo is required but is not installed"
+    else
+        command -v sudo >/dev/null 2>&1 || die "sudo is required but is not installed"
+    fi
 
     # Probe non-interactively first, and only prime the timestamp if that
     # fails.

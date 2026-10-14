@@ -3864,6 +3864,123 @@ _stub_sudo_unavailable() {
     [[ "$output" == *"not as root"* ]]
 }
 
+# ── sudo wrapper ──────────────────────────────────────────────────────────────
+#
+# Each test runs a fresh bash with no sudo function in its environment (setup's
+# stub is exported, and the wrapper stands down for one) and a fake `sudo`
+# first on PATH that exits with the status in FAKE_RC.
+
+_sudo_wrapper_run() {   # _sudo_wrapper_run <FAKE_RC> <script body>
+    mkdir -p "${TMP}/fakebin"
+    printf '#!/bin/sh\necho "fake sudo: $*"\nexit "${FAKE_RC:-0}"\n' > "${TMP}/fakebin/sudo"
+    chmod +x "${TMP}/fakebin/sudo"
+    run env -u BASH_FUNC_sudo%% FAKE_RC="$1" PATH="${TMP}/fakebin:${PATH}" bash -c '
+        . "'"${LIB}"'/log.sh"
+        . "'"${LIB}"'/privilege.sh"
+        '"$2"
+}
+
+@test "sudo wrapper: a sudo that returns 130 interrupts the script" {
+    _sudo_wrapper_run 130 '
+        trap "echo TRAP-INT; exit 130" INT
+        sudo -n true
+        echo CARRIED-ON'
+    [ "$status" -eq 130 ]
+    [[ "$output" == *"fake sudo: -n true"* ]]
+    [[ "$output" == *"TRAP-INT"* ]]
+    [[ "$output" != *"CARRIED-ON"* ]]
+}
+
+@test "sudo wrapper: with no INT trap the script dies of the signal" {
+    _sudo_wrapper_run 130 'sudo true; echo CARRIED-ON'
+    [ "$status" -eq 130 ]
+    [[ "$output" != *"CARRIED-ON"* ]]
+}
+
+@test "sudo wrapper: inside a command substitution the subshell stops too" {
+    _sudo_wrapper_run 130 '
+        trap "echo TRAP-INT; exit 130" INT
+        x="$(sudo true; echo SUBSHELL-CARRIED-ON >&2)" 2>&1
+        echo CARRIED-ON'
+    [ "$status" -eq 130 ]
+    [[ "$output" == *"TRAP-INT"* ]]
+    [[ "$output" != *"CARRIED-ON"* ]]
+}
+
+@test "sudo wrapper: any other status is returned and nothing is signalled" {
+    _sudo_wrapper_run 0 'trap "echo TRAP-INT; exit 130" INT; sudo true; echo "rc=$?"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rc=0"* ]]
+    for rc in 1 2 129 131 143; do
+        _sudo_wrapper_run "$rc" 'trap "echo TRAP-INT; exit 130" INT; sudo true || echo "rc=$?"; echo CARRIED-ON'
+        [ "$status" -eq 0 ]
+        [[ "$output" == *"rc=${rc}"* ]]
+        [[ "$output" == *"CARRIED-ON"* ]]
+        [[ "$output" != *"TRAP-INT"* ]]
+    done
+}
+
+@test "sudo wrapper: while SIGINT is ignored (a teardown) a 130 is only a status" {
+    _sudo_wrapper_run 130 'trap "" INT; sudo true || echo "rc=$?"; echo CARRIED-ON'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rc=130"* ]]
+    [[ "$output" == *"CARRIED-ON"* ]]
+}
+
+@test "sudo wrapper: 'command sudo' bypasses it" {
+    _sudo_wrapper_run 130 'trap "echo TRAP-INT; exit 130" INT; command sudo true || echo "rc=$?"; echo CARRIED-ON'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rc=130"* ]]
+    [[ "$output" != *"TRAP-INT"* ]]
+}
+
+@test "sudo wrapper: an existing sudo function is left in charge" {
+    mkdir -p "${TMP}/fakebin"
+    printf '#!/bin/sh\necho REAL-SUDO-RAN\nexit 130\n' > "${TMP}/fakebin/sudo"
+    chmod +x "${TMP}/fakebin/sudo"
+    # setup's stub is exported: the child bash imports it before sourcing.
+    run env PATH="${TMP}/fakebin:${PATH}" bash -c '
+        . "'"${LIB}"'/log.sh"
+        . "'"${LIB}"'/privilege.sh"
+        echo "wrapped=${_SUDO_WRAPPER:+1}"
+        sudo echo STUB-RAN'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"wrapped="$'\n'* ]]
+    [[ "$output" == *"STUB-RAN"* ]]
+    [[ "$output" != *"REAL-SUDO-RAN"* ]]
+}
+
+@test "require_unprivileged: with the wrapper defined, a missing sudo binary is still reported" {
+    mkdir -p "${TMP}/nosudo"
+    for t in bash id date; do ln -s "$(type -P "$t")" "${TMP}/nosudo/$t"; done
+    run env -u BASH_FUNC_sudo%% PATH="${TMP}/nosudo" bash -c '
+        . "'"${LIB}"'/log.sh"
+        . "'"${LIB}"'/privilege.sh"
+        echo "wrapped=${_SUDO_WRAPPER:+1}"
+        require_unprivileged'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"wrapped=1"* ]]
+    [[ "$output" == *"sudo is required but is not installed"* ]]
+}
+
+@test "require_unprivileged: a sudo stub defined after sourcing counts as sudo, binary or not" {
+    mkdir -p "${TMP}/nosudo"
+    for t in bash id date; do ln -s "$(type -P "$t")" "${TMP}/nosudo/$t"; done
+    run env -u BASH_FUNC_sudo%% PATH="${TMP}/nosudo" bash -c '
+        . "'"${LIB}"'/log.sh"
+        . "'"${LIB}"'/privilege.sh"
+        sudo() { return 0; }
+        require_unprivileged && echo PASSED'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PASSED"* ]]
+}
+
+@test "sudo wrapper: a trap that does not exit runs, and the script goes on from there" {
+    _sudo_wrapper_run 130 'n=0; trap "n=\$(( n + 1 ))" INT; sudo true || true; echo "traps=$n"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"traps=1"* ]]
+}
+
 # ── log.sh: transcripts ───────────────────────────────────────────────────────
 
 @test "log_transcript_path builds <root>/<tool>/<label>-<UTC stamp>.log" {
