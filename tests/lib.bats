@@ -4704,6 +4704,12 @@ link set dev wlan9 address 02:AA:bb:cc:dd:ee" ]
     [ "$status" -eq 5 ]
     run mac_set_ns "../lab" wlan9 02:aa:bb:cc:dd:ee
     [ "$status" -eq 5 ]
+    run mac_set_ns "." wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 5 ]
+    run mac_set_ns ".." wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 5 ]
+    run mac_set_ns "-n" wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 5 ]
     [ ! -e "${TMP}/ip.calls" ]
     echo nodown > "${TMP}/ip.mode"; run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
     [ "$status" -eq 2 ]

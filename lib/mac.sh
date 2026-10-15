@@ -62,11 +62,13 @@ mac_set() {
 #
 # Status: 0-4 as mac_set, and
 #   5  <netns> is not a name `ip netns` would have created (letters, digits,
-#      '.', '_' and '-'), refused before anything runs
+#      '.', '_' and '-'; not '.' or '..', not starting with '-'), refused
+#      before anything runs. `ip -n` opens /run/netns/<name> as given, so a
+#      '/' would reach another path and '..' the directory above.
 mac_set_ns() {
     local netns="${1:-}" iface="${2:-}" mac="${3:-}" now
     [[ "$mac" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]] || return 1
-    [[ "$netns" =~ ^[A-Za-z0-9._-]+$ ]] || return 5
+    [[ "$netns" =~ ^[A-Za-z0-9._-]+$ && "$netns" != . && "$netns" != .. && "$netns" != -* ]] || return 5
     sudo ip -n "$netns" link set dev "$iface" down || return 2
     sudo ip -n "$netns" link set dev "$iface" address "$mac" || return 3
     now="$(sudo ip -n "$netns" -br link show dev "$iface" 2>/dev/null | awk 'NR == 1 { print tolower($3) }')" || return 4
