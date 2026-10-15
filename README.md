@@ -18,6 +18,7 @@ their own repositories.
 lib/log.sh            timestamped, per-stream colour-aware logging
 lib/privilege.sh      enforce run-as-user / escalate-per-command
 lib/cleanup.sh        stack of teardown handlers sharing one EXIT trap
+lib/child.sh          run a privileged command as a tracked background child
 lib/journal.sh        append-only record of persistent system changes
 lib/backup.sh         the .orig / .bak backup convention
 lib/teardown.sh       snapshot what a rebuild removes, stop units, remove it
