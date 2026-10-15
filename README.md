@@ -27,7 +27,7 @@ lib/apt.sh            APT repository and package helpers
 lib/host.sh           hostname validation and setting
 lib/net.sh            address, mask and range arithmetic
 lib/oui.sh            MAC vendor lookup
-lib/mac.sh            read an interface's MAC address; set it and read it back
+lib/mac.sh            read an interface's MAC address; set it and read it back, in this or another network namespace
 lib/git.sh            git identity, GitHub ssh stanza, pinned host key
 bin/provision-report  read and verify the change journal
 bin/bld               resolve # include: directives into a self-contained script
@@ -431,6 +431,34 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.11.0
+
+One addition, for an interface that lives in another network namespace.
+
+- **`mac.sh`: `mac_set_ns <netns> <iface> <mac>`.** `mac_set` through
+  `ip -n <netns>`: link down, address set, and the read-back that decides
+  the result, taken from `ip -n <netns> -br link show` because
+  `/sys/class/net` only shows the caller's own namespace. Same statuses as
+  `mac_set`, plus 5 for a namespace name `ip netns` could not have created
+  (anything but letters, digits, `.`, `_` and `-`), refused before any
+  command runs. Every step goes through `sudo`, the read-back included, since
+  entering a namespace needs CAP_SYS_ADMIN. Added for wifi-trainer, whose
+  simulated radios are moved into per-network namespaces before their
+  addresses are randomised (FA-wifi-trainer-004); until now that was the one
+  tool in the fleet setting a MAC without `mac.sh`.
+
+## Changes in v1.10.0
+
+`child.sh` — run a privileged command as a tracked background child and stop
+it reliably under sudo and sudo-rs. `start_child <pid-var> <log> <cmd...>`
+backgrounds the command under `command sudo` (so `$!` is sudo, not the
+wrapper subshell) with stdin from `/dev/null`; `stop_child <pid-var>` sends
+SIGTERM, waits, then SIGKILLs the whole process tree under the sudo child;
+`_child_alive` requires the pid to still be this script's own child before
+signalling, so a reused pid is never hit. `STOP_CHILD_KILLED` is set when
+escalation to SIGKILL was needed. Lifted out of open-wifi-scanner (which now
+consumes it); wifi-cap-test is the other consumer. Depends on nothing.
 
 ## Changes in v1.9.0
 

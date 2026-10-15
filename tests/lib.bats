@@ -4638,6 +4638,11 @@ _mac_env() {
             *" address "*)
                 [[ "$mode" != reject ]] || return 1
                 [[ "$mode" == ignore ]] || echo "${*: -1}" > "${_MAC_SYSFS}/wlan9/address" ;;
+            # `ip -n <ns> -br link show dev <if>`: the namespace form's read-back,
+            # answered from the same fake sysfs in iproute2's brief layout.
+            "-n "*" -br link show dev "*)
+                [[ "$mode" != noshow ]] || return 1
+                printf '%-16s DOWN           %s <BROADCAST,MULTICAST>\n' "${*: -1}" "$(cat "${_MAC_SYSFS}/wlan9/address")" ;;
         esac
     }
     # shellcheck source=/dev/null
@@ -4675,6 +4680,38 @@ link set dev wlan9 address 02:AA:bb:cc:dd:ee" ]
     [ "$status" -eq 3 ]
     # Accepted by the kernel, but the interface still reports the old address.
     echo ignore > "${TMP}/ip.mode"; run mac_set wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 4 ]
+    [ -z "$output" ]
+}
+
+@test "mac_set_ns: runs every step through ip -n <netns> and reads back with ip -br, not sysfs" {
+    _mac_env
+    # Log what sudo is asked to run, then run it (the ip stub above).
+    sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.log"; "$@"; }
+    mac_set_ns lab-1 wlan9 02:AA:bb:cc:dd:ee
+    [ "$(cat "${TMP}/ip.calls")" = "-n lab-1 link set dev wlan9 down
+-n lab-1 link set dev wlan9 address 02:AA:bb:cc:dd:ee
+-n lab-1 -br link show dev wlan9" ]
+    # Every call went through sudo (the stub logs what it was asked to run).
+    [ "$(grep -c '^ip -n lab-1 ' "${TMP}/sudo.log")" -eq 3 ]
+}
+
+@test "mac_set_ns: each way of failing has its own status, and a bad namespace name runs nothing" {
+    _mac_env
+    run mac_set_ns lab-1 wlan9 "02:aa:bb:cc:dd"
+    [ "$status" -eq 1 ]
+    run mac_set_ns "lab 1" wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 5 ]
+    run mac_set_ns "../lab" wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 5 ]
+    [ ! -e "${TMP}/ip.calls" ]
+    echo nodown > "${TMP}/ip.mode"; run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 2 ]
+    echo reject > "${TMP}/ip.mode"; run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 3 ]
+    echo ignore > "${TMP}/ip.mode"; run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 4 ]
+    echo noshow > "${TMP}/ip.mode"; run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
     [ "$status" -eq 4 ]
     [ -z "$output" ]
 }
