@@ -230,6 +230,8 @@ _backup_chain() {
     done
 }
 
+# Consumed by lib/file.sh as well (together with _backup_exists): a change
+# to what either prints or returns reaches install_file_if_changed.
 # _backup_dir_closed <file> — can the backup be written beside <file> without
 # another account getting a hand in? The file's directory, resolved to its
 # canonical path, and every ancestor of that must be a real directory owned

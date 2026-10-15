@@ -21,6 +21,7 @@ lib/cleanup.sh        stack of teardown handlers sharing one EXIT trap
 lib/child.sh          run a privileged command as a tracked background child
 lib/journal.sh        append-only record of persistent system changes
 lib/backup.sh         the .orig / .bak backup convention
+lib/file.sh           write a root-owned file only when its content, mode or owner changes
 lib/teardown.sh       snapshot what a rebuild removes, stop units, remove it
 lib/os.sh             OS, arch, kernel, init and session detection
 lib/apt.sh            APT repository and package helpers
@@ -338,6 +339,14 @@ journal_init "my-script" "$SCRIPT_VERSION"
 backup_file /etc/some/config.conf "enabling widget support"
 # … modify it …
 journal_record modify /etc/some/config.conf "enabled widget support"
+
+# A file whose whole content the script owns: compared, backed up, written
+# atomically and journalled in one call, and only when something differs.
+# include: file.sh
+install_file_if_changed /etc/widget.d/50-site.conf "widget site drop-in" <<CONF
+option = value
+CONF
+(( INSTALL_FILE_CHANGED )) && sudo systemctl restart widget.service
 ```
 
 ## Building
@@ -435,6 +444,53 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.12.0
+
+One new module, lifting a sequence four consumers had each written for
+themselves (sys-bld, gps-time-sync, log-ship, wireguard-bld), none of them
+quite alike.
+
+- **`file.sh`: `install_file_if_changed [--mode M] [--allow-empty]
+  [--no-backup] [--quiet] <dest> <reason>`**, content on stdin (a heredoc,
+  `<<<` or `< file`; never a pipe, which would run it in a subshell). It
+  stages the content, does nothing when `<dest>` already holds those bytes
+  with that mode (default 0644) and root as owner — mode and owner count as
+  content — and otherwise backs an existing file up with `backup_file` (or,
+  with `--no-backup`, records the previous content's sha256 under the
+  journal's own world-readable rule), creates missing parents one level at a
+  time as root's 0755 directories, installs the content under a random
+  root-owned name beside the target and renames it over, and journals
+  `create` or `modify` with the reason. Empty content, meaning nothing but
+  whitespace (`<<< "$unset"` yields one newline), is refused unless
+  `--allow-empty`. `INSTALL_FILE_CHANGED` is 1 after a write, for the callers
+  that restart something only then. A file that matches in content and
+  differs only in mode or owner is rewritten and journalled but not backed
+  up. The comparison is byte for byte: content with a per-run stamp belongs
+  with a caller-side comparison, or without the stamp.
+
+- **Where root may write.** Every directory root is about to use passes the
+  rule `backup_file` already applies to the directory it writes a backup
+  into: each component up to `/` a directory of root's or the invoking
+  user's that nobody else can write, or sticky and world-writable with the
+  kernel's `protected_symlinks` and `protected_regular` on. The path is
+  walked as written, one component at a time, so a link is followed only
+  when the directory holding it has already passed — a link planted as a
+  middle component in a directory others can write is refused even when it
+  points into a closed one — and the file is written at the canonical path
+  the walk reached. The same walk covers `TMPDIR`, where the content waits
+  as the user's file before root reads it. A refusal is logged and returns
+  1. Parents are made with `mkdir` per level, never `install -d`, which
+  follows a link at the path and would chmod and chown what it points to.
+  Existence is probed through the yes/no helper `backup.sh` uses, so a
+  `sudo` that failed to run is never read as "the file is not there", and a
+  destination that exists but is not a regular file (a directory, a FIFO) is
+  refused before anything opens it.
+
+- **Three smaller helpers under the same rule:** `file_differs <src> <dest>
+  <mode>` (a predicate; a failed check reads as "differs", so a broken sudo
+  costs a rewrite and a `.bak` per run and never a skipped write),
+  `install_atomic <src> <mode> <dest>` and `mkdir_root_p <dir>`.
 
 ## Changes in v1.11.0
 
