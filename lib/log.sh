@@ -18,6 +18,18 @@
 [[ -n "${_LIB_LOG_SOURCED:-}" ]] && return 0
 _LIB_LOG_SOURCED=1
 
+# The one piece of process state the library sets: every consumer runs under
+# umask 022 from the moment it loads this module, whatever the caller's shell
+# had. sudo-rs (0.2.13, Ubuntu 26.04) hands the caller's umask on, so from an
+# interactive shell at 077 a `sudo tee` or `sudo install` without an explicit
+# mode leaves a 0600 root-only file: apt keyrings _apt cannot read, sources
+# files rewritten on every run (that was v1.7.0's apt_add_repo fix, one site
+# at a time). Pinning it here, in the module every consumer includes first,
+# covers every write site in every consumer at once, and is what lets the
+# interactive shells of the fleet move to 077 (ksgill, 2026-10-15). A file
+# that must be private is still given its mode explicitly, as before.
+umask 022
+
 _LOG_RED=$'\033[0;31m'
 _LOG_GRN=$'\033[0;32m'
 _LOG_YEL=$'\033[1;33m'

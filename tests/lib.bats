@@ -4715,3 +4715,14 @@ link set dev wlan9 address 02:AA:bb:cc:dd:ee" ]
     [ "$status" -eq 4 ]
     [ -z "$output" ]
 }
+
+# ── log.sh: the umask pin ─────────────────────────────────────────────────────
+# A fresh bash, so the module's source guard does not skip the pin. The 077
+# shell stands for an interactive shell the fleet may move to; a consumer
+# must still create 0644 files from it.
+@test "log.sh pins umask 022 for every consumer, whatever the caller's shell had" {
+    run bash --noprofile --norc -c 'umask 077; . "$1/log.sh"; umask; : > "$2/made-under-the-pin"' bash "$LIB" "$TMP"
+    [ "$status" -eq 0 ]
+    [ "$output" = 0022 ]
+    [ "$(stat -c '%a' "${TMP}/made-under-the-pin")" = 644 ]
+}

@@ -59,7 +59,11 @@ charge.
 
 **Library files never set shell options.** `set -euo pipefail` belongs to the
 entry-point script; a library that sets it changes the behaviour of code that
-did not ask for it. Library files assume strict mode is in effect.
+did not ask for it. Library files assume strict mode is in effect. The one
+piece of process state the library does set is the umask: `log.sh`, which
+every consumer includes first, runs `umask 022`, so a consumer creates 0644
+files and 0755 directories whatever shell started it (since v1.11.0; see
+below). A file that must be private is given its mode explicitly.
 
 **Every file is guarded against double-sourcing** and declares its dependencies
 in the header comment.
@@ -434,7 +438,18 @@ through.
 
 ## Changes in v1.11.0
 
-One addition, for an interface that lives in another network namespace.
+One addition, for an interface that lives in another network namespace, and
+one piece of process state the library now sets for every consumer.
+
+- **`log.sh` pins `umask 022`.** sudo-rs (0.2.13, the `sudo` of Ubuntu 26.04)
+  hands the caller's umask on, so from an interactive shell at 077 every
+  `sudo tee` and `sudo install` without an explicit mode left a 0600
+  root-only file: apt keyrings `_apt` could not read, sources files rewritten
+  on every run. v1.7.0 fixed one such site; this covers every write site in
+  every consumer at once, from the moment `log.sh` loads, and is what lets
+  the fleet's interactive shells move to 077. Consumers that pinned the
+  umask themselves (sys-bld, openvpn-bld) can keep the line; it is now
+  redundant. Nothing changes for a file whose mode is set explicitly.
 
 - **`mac.sh`: `mac_set_ns <netns> <iface> <mac>`.** `mac_set` through
   `ip -n <netns>`: link down, address set, and the read-back that decides
