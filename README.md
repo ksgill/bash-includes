@@ -29,6 +29,9 @@ lib/host.sh           hostname validation and setting
 lib/net.sh            address, mask and range arithmetic
 lib/oui.sh            MAC vendor lookup
 lib/mac.sh            read an interface's MAC address; set it and read it back, in this or another network namespace
+lib/netdev.sh         an interface's existence, IFF_UP state and wireless phy; the modes a phy supports
+lib/nft.sh            jq programs over nft's JSON listings: chain policy, other forward users, filter family, jump handles
+lib/sshd.sh           the SSH ports sshd is configured for (sshd -T), ssh.socket listens on, and sshd actually holds (ss)
 lib/git.sh            git identity, GitHub ssh stanza, pinned host key
 bin/provision-report  read and verify the change journal
 bin/bld               resolve # include: directives into a self-contained script
@@ -444,6 +447,84 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.13.0
+
+Three modules lifted out of the consumers that each carried them twice or
+three times (FA-fleet-020, FA-fleet-021), and two fixes to what was here.
+
+- **`nft.sh`** — the jq programs the VPN builders and their root-run hooks
+  decide on, over `nft -j list ruleset` / `list chains` / `-a list chain`,
+  never the text listing (a rule comment can forge a text line):
+  `_NFT_POLICY_JQ` (a chain's policy, `missing`, or `none` for a regular
+  chain and for a chain named forward on any other hook), `_NFT_FWD_OTHERS_JQ`
+  (every other base chain on the forward hook, Docker's `ip filter FORWARD`
+  included, ip6 excluded for an ip family), `_NFT_DETECT_FAMILY_JQ` and
+  `_NFT_FILTER_FAMILY_JQ` (which filter table a hook should use, and which
+  one it did use), `_NFT_JUMP_HANDLES_JQ`, `_NFT_HAS_JUMP_JQ` and
+  `_NFT_EXACT_JUMP_JQ` (a conditional jump is a jump but not the
+  unconditional one a hook verifies), `_NFT_COUNT_JQ` and
+  `_NFT_CHAINS_NAMED_JQ` (exact names, given as a JSON list). Assignments
+  only, no single quote in any program, so a hook that includes only
+  `log.sh` can include this too. Which chain, which policy and what to do
+  about the answer stay with the caller.
+
+- **`sshd.sh`** — the SSH ports, one per line, sorted, numeric, from each
+  source separately so the caller sets the policy: `sshd_ports_configured`
+  (`sshd -T`; the `listenaddress` ports when there are any, else the `port`
+  lines, which is what sshd binds; returns 1 when `sshd -T` fails so the
+  caller can tell "no sshd" from "broken config"), `sshd_ports_socket`
+  (ssh.socket's `Listen=`, Stream lines only; returns 1 when the socket is
+  not active), `sshd_ports_listening [socket-port...]` (`ss -Htlnp`, a
+  listener counting only when the sshd master holds it or pid 1 holds it on
+  a socket port — never by process name, which any user can forge) and
+  `sshd_master_pid`. stderr passes through; a caller that wants silence
+  redirects it. The two VPN builders compare the configured and listening
+  sets and flag the session's own port; sys-bld takes the configured set
+  minus 22. One parse is fixed on the way in: a scoped IPv6 socket address
+  (`[fe80::1%eth0]:22`) lost its port to the scope strip. And one thing the
+  three originals all got wrong is named in the header and given a
+  reader: a port is not an endpoint. `sshd_endpoints_configured` and
+  `sshd_endpoints_socket` print `<address> <port>` (`*` for a port line),
+  because a `ListenAddress 10.8.0.1:2222` turned into `tcp dport 2222
+  accept` opens 2222 on every address, where any local user can bind it
+  alongside sshd (only the wildcard bind conflicts) and be reached from
+  outside. The consumers still write port-wide rules today; the finding is
+  theirs to fix with `ip daddr` / `ip6 daddr` on a non-wildcard address.
+
+- **`netdev.sh`** — `iface_exists`, `iface_is_up` (IFF_UP from sysfs: admin
+  up, not carrier), `iface_phy` (the phy behind a wireless interface, via
+  `readlink -e`, so a wired one never reports a phy named `phy80211`),
+  `phy_modes_parse` (stdin) and `phy_modes <phy>` (the modes under
+  "Supported interface modes", one per line, awk not grep because grep does
+  not expand `\t`), `phy_supports_mode <phy> <mode>`. `phy_modes` returns 1
+  when `iw` fails instead of printing nothing under `|| true`, so a caller
+  under `set -e` writes `modes="$(phy_modes "$phy")" || modes=""`, or parses
+  an `iw` capture it already holds with `phy_modes_parse`. Not named `iface.sh`:
+  `bld` resolves an include with the consumer's own `lib/` first, and
+  wifi-cap-test has one. `_NETDEV_SYSFS` points tests at a temp tree, as
+  `_MAC_SYSFS` does.
+
+- **`mac.sh` runs `ip` directly when already root** (FA-bash-includes-015).
+  `mac_set` and `mac_set_ns` went through `sudo` whatever the EUID; a script
+  that runs whole as root (wifi-trainer, by documented exception) logged
+  three sudo calls per radio, and on a minimal image with no sudo binary
+  the first `sudo ip … down` failed "command not found" and `mac_set`
+  reported the link as not coming down. `_mac_root` elevates only when the
+  script is not root; `_MAC_EUID` is the test seam (EUID is read-only).
+  wifi-trainer can drop its `ensure_command sudo` once re-pinned.
+
+- **`bld` builds the same artefact on every machine** (FA-bash-includes-016).
+  An `# embed:` glob matching several files embedded them in the caller's
+  locale collation (en_US.UTF-8 puts `firefox-policies.json` before
+  `firefox-policies-no-lookups.json`, C after it), so a dist/ built on a
+  workstation failed CI's freshness check; each glob's matches are now
+  sorted under `LC_ALL=C`, with the embed lines themselves kept in written
+  order. And the directives were read with `grep -oP … || true`: PCRE grep
+  differs on aarch64, and on a grep without `-P` the `|| true` turned the
+  failure into "no includes" — a built script with no library in it, found
+  only when it ran. They are read with a bash regex now, which cannot fail
+  quietly. sys-bld's `export LC_ALL=C` in its build.sh is no longer needed.
 
 ## Changes in v1.12.0
 

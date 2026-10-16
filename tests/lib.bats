@@ -3585,6 +3585,103 @@ EOF
 }
 
 
+# ── bld: embed order and directive parsing ────────────────────────────────────
+# Pathname expansion sorts a glob's matches in the caller's collation, so a
+# glob matching several files embedded them in locale-dependent order: under
+# en_US.UTF-8 punctuation is ignored and policies.json sorts first, under C
+# '-' < '.' and policies-no-lookups.json does. A dist/ built on a workstation
+# then failed CI's freshness check (FA-bash-includes-016). bld now sorts each
+# glob's matches under C itself, whatever locale it runs in.
+#
+# The directives were read with `grep -oP ... || true`: PCRE grep differs on
+# aarch64, and on a grep without -P the `|| true` turned the error into a
+# build with no library in it. They are a bash regex now, with the old \S+
+# tolerance for what follows the name (trailing spaces, a CR from a CRLF
+# source) kept.
+
+_bld_directive_fixture() {
+    local repo="${TMP}/blddir"
+    mkdir -p "${repo}/data" "${repo}/dist"
+    git -C "${repo}" init -q .
+    git -C "${repo}" config user.email 'test@example.invalid'
+    git -C "${repo}" config user.name 'test'
+
+    printf '{"lookups": true}\n'  > "${repo}/data/policies.json"
+    printf '{"lookups": false}\n' > "${repo}/data/policies-no-lookups.json"
+    printf 'present\n' > "${repo}/data/opt-present.txt"
+
+    # Trailing spaces after the include name and a CR after the first optional
+    # embed's glob, as a source edited on the wrong platform would carry. The
+    # `# include:` after the close marker is prose, not a directive.
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'set -euo pipefail\n'
+        printf '# >>> bash-includes >>>\n'
+        printf '# include: log.sh   \n'
+        printf '# embed: data/policies*.json\n'
+        printf '# embed?: data/opt-*.txt\r\n'
+        printf '# embed?: data/absent-*.txt\n'
+        printf '_bootstrap_lib() { . "%s/log.sh"; }\n' "$LIB"
+        printf '_bootstrap_lib\n'
+        printf '# <<< bash-includes <<<\n'
+        printf '# A note for readers, outside the marker block, so not a directive:\n'
+        printf '# include: journal.sh\n'
+        printf 'cat "${BLD_EMBED_DIR}/data/$1"\n'
+    } > "${repo}/dir.sh"
+    git -C "${repo}" add -A
+    git -C "${repo}" commit -qm 'fixture'
+}
+
+# bld on the fixture above, run under the given locale.
+_bld_directive_run() {
+    ( cd "${TMP}/blddir" && LC_ALL="$1" "${BIN}/bld" -L "${LIB}" -o dist dir.sh )
+}
+
+# The policies files in the order the artifact extracts them.
+_bld_embed_order() {
+    sed -n 's|^cat > "\$BLD_EMBED_DIR/data/\(policies[^"]*\)" <<.*|\1|p' "${TMP}/blddir/dist/dir.sh"
+}
+
+@test "bld embeds a glob's several matches in C order" {
+    _bld_directive_fixture
+    run _bld_directive_run C
+    [ "$status" -eq 0 ]
+    [ "$(_bld_embed_order)" = "policies-no-lookups.json
+policies.json" ]
+}
+
+@test "bld embeds a glob's matches in the same C order when run under en_US.UTF-8" {
+    locale -a 2>/dev/null | grep -qiE '^en_US\.utf-?8$' \
+        || skip "en_US.UTF-8 locale is not installed"
+    _bld_directive_fixture
+    run _bld_directive_run en_US.UTF-8
+    [ "$status" -eq 0 ]
+    [ "$(_bld_embed_order)" = "policies-no-lookups.json
+policies.json" ]
+}
+
+@test "bld resolves includes and optional embeds without PCRE, and leaves a prose include alone" {
+    _bld_directive_fixture
+    run _bld_directive_run C
+    [ "$status" -eq 0 ]
+    # The optional embed matching nothing was noted and skipped, not fatal.
+    [[ "$output" == *"optional embed 'data/absent-*.txt' matched nothing"* ]]
+    local out="${TMP}/blddir/dist/dir.sh"
+
+    # The include, trailing spaces and all, was resolved and inlined...
+    grep -q '^# Library: log.sh $' "$out"
+    grep -q 'log_open_transcript()' "$out"
+    # ...and the one mentioned in prose below the markers was not.
+    run ! grep -q 'journal_init()' "$out"
+
+    # The optional embed whose glob ended in CR still matched and extracts
+    # byte-for-byte, and the CR reached neither the glob nor the artifact.
+    bash "$out" opt-present.txt > "${TMP}/out"
+    cmp "${TMP}/blddir/data/opt-present.txt" "${TMP}/out"
+    run ! grep -q $'\r' "$out"
+}
+
+
 # ── git.sh ────────────────────────────────────────────────────────────────────
 
 @test "git_identity_config sets name, email and the default branch" {
@@ -4686,7 +4783,9 @@ link set dev wlan9 address 02:AA:bb:cc:dd:ee" ]
 
 @test "mac_set_ns: runs every step through ip -n <netns> and reads back with ip -br, not sysfs" {
     _mac_env
-    # Log what sudo is asked to run, then run it (the ip stub above).
+    # Log what sudo is asked to run, then run it (the ip stub above). The
+    # seam is pinned to a non-root EUID so this holds when bats runs as root.
+    _MAC_EUID=1000
     sudo() { printf '%s\n' "$*" >> "${TMP}/sudo.log"; "$@"; }
     mac_set_ns lab-1 wlan9 02:AA:bb:cc:dd:ee
     [ "$(cat "${TMP}/ip.calls")" = "-n lab-1 link set dev wlan9 down
@@ -4720,6 +4819,32 @@ link set dev wlan9 address 02:AA:bb:cc:dd:ee" ]
     echo noshow > "${TMP}/ip.mode"; run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
     [ "$status" -eq 4 ]
     [ -z "$output" ]
+}
+
+@test "mac_set and mac_set_ns: run ip directly when already root, through sudo otherwise" {
+    _mac_env
+    # The seam defaults to the real EUID. From here on any sudo call is loud
+    # and fatal, so the root path must never reach it.
+    [ "$_MAC_EUID" = "$EUID" ]
+    sudo() { printf 'SUDO-CALLED\n' >&2; return 99; }
+    _MAC_EUID=0
+    run mac_set wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ef
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(grep -c . "${TMP}/ip.calls")" -eq 5 ]
+    # Any other EUID: the first ip call goes through sudo, and its failure is
+    # reported as the link not coming down.
+    _MAC_EUID=1000
+    run mac_set wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 2 ]
+    [ "$output" = SUDO-CALLED ]
+    run mac_set_ns lab-1 wlan9 02:aa:bb:cc:dd:ee
+    [ "$status" -eq 2 ]
+    [ "$output" = SUDO-CALLED ]
+    [ "$(grep -c . "${TMP}/ip.calls")" -eq 5 ]
 }
 
 # ── log.sh: the umask pin ─────────────────────────────────────────────────────

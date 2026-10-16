@@ -99,6 +99,34 @@ read_includes() {
     ' "$1"
 }
 
+# The directives in a source's marker block, read from stdin, one per output
+# line as "<kind> <name>": kind is include, embed or embed?, name the first
+# run of non-blank characters after the colon, so trailing spaces, a CR from
+# a CRLF source, or a remark after the name are dropped (what the \S+ of the
+# `grep -oP` this replaces accepted). A bash regex and nothing that can fail
+# quietly: PCRE grep differs on aarch64, and a grep without -P under `|| true`
+# built a script with no library in it at all, found only when it ran.
+read_directives() {
+    local re='^#[[:space:]]*(include|embed|embed\?):[[:space:]]*([^[:space:]]+)' line
+    while IFS= read -r line; do
+        [[ "$line" =~ $re ]] || continue
+        printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    done
+}
+
+# The files one embed glob matches under <repo>, NUL-terminated, in C
+# collation order. Pathname expansion sorts in the caller's locale, so a glob
+# matching several files embedded them in one order on a workstation under
+# en_US.UTF-8 and another under CI's C, and dist/ failed the freshness check.
+# Only the matches of one glob are sorted; the embed lines keep their order.
+embed_matches() {
+    local repo="$1" glob="$2" f
+    for f in "${repo}"/${glob}; do
+        [[ -f "$f" ]] || continue
+        printf '%s\0' "$f"
+    done | LC_ALL=C sort -z
+}
+
 RESOLVED=()      # emit order, dependencies first
 declare -A STATE # name -> visiting | done
 
@@ -168,36 +196,29 @@ build_one() {
     RESOLVED=()
     STATE=()
 
-    local block name glob
+    local block kind name
+    local embeds=() hits=()
     block="$(sed -n "$((open_line + 1)),$((close_line - 1))p" "$src")"
 
-    while read -r name; do
-        [[ -n "$name" ]] && resolve "$name" "$(basename -- "$src")"
-    done < <(grep -oP '^#\s*include:\s*\K\S+' <<< "$block" || true)
-
-    local embeds=()
-    local f matched glob
     # Globs are relative to the repo root. A required embed matching nothing is
     # fatal: the built script would reference data that is not there and fail
     # at runtime, far from the cause. Genuinely optional data (rover's icon)
     # uses "# embed?:" instead.
-    while read -r glob; do
-        [[ -n "$glob" ]] || continue
-        matched=0
-        for f in "${repo}"/${glob}; do
-            [[ -f "$f" ]] && { embeds+=("$f"); matched=1; }
-        done
-        [[ "$matched" -eq 1 ]] \
-            || die "${src}: '# embed: ${glob}' matched nothing under ${repo} — build what it needs first, or mark it '# embed?:' if optional"
-    done < <(grep -oP '^#\s*embed:\s*\K\S+' <<< "$block" || true)
-    while read -r glob; do
-        [[ -n "$glob" ]] || continue
-        matched=0
-        for f in "${repo}"/${glob}; do
-            [[ -f "$f" ]] && { embeds+=("$f"); matched=1; }
-        done
-        [[ "$matched" -eq 1 ]] || info "optional embed '${glob}' matched nothing — skipped"
-    done < <(grep -oP '^#\s*embed\?:\s*\K\S+' <<< "$block" || true)
+    while read -r kind name; do
+        case "$kind" in
+            include)
+                resolve "$name" "$(basename -- "$src")" ;;
+            embed|'embed?')
+                mapfile -d '' -t hits < <(embed_matches "$repo" "$name")
+                if [[ ${#hits[@]} -gt 0 ]]; then
+                    embeds+=("${hits[@]}")
+                elif [[ "$kind" == embed ]]; then
+                    die "${src}: '# embed: ${name}' matched nothing under ${repo} — build what it needs first, or mark it '# embed?:' if optional"
+                else
+                    info "optional embed '${name}' matched nothing — skipped"
+                fi ;;
+        esac
+    done < <(read_directives <<< "$block")
 
     local version
     if [[ -z "${VERSION_CACHE[$repo]:-}" ]]; then
