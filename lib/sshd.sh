@@ -75,14 +75,25 @@ _sshd_valid_endpoints() {
 
 # ── _sshd_split_endpoint <address:port form> ──────────────────────────────────
 # stdin: one "<addr>:<port>" per line as sshd -T and systemd print them —
-# "0.0.0.0:22", "[::]:22", "[fe80::1%eth0]:22", or a bare "22" (systemd's
-# ListenStream=22) — stdout: "<address> <port>", brackets removed, "*" for a
-# bare port. An unbracketed IPv6 or a portless address prints nothing: the
-# port cannot be told from the address, and neither tool prints those forms.
+# "0.0.0.0:22", "[::]:22", a bare "22" (systemd's ListenStream=22), and a
+# scoped link-local address in either tool's form: sshd -T puts the scope
+# inside the brackets, "[fe80::1%eth0]:22"; systemd puts it after the port,
+# "[fe80::1]:22%eth0" (systemd.socket(5): "[x]:y%dev"; systemd 259 rejects
+# the other form) — stdout: "<address> <port>", brackets removed, the scope
+# on the address either way ("fe80::1%eth0 22"), "*" for a bare port. An
+# unbracketed IPv6 or a portless address prints nothing: the port cannot be
+# told from the address, and neither tool prints those forms.
 _sshd_split_endpoint() {
     awk '
         /^[0-9]+$/ { print "*", $0; next }
-        /^\[/ { if (match($0, /\]:[0-9]+$/)) print substr($0, 2, RSTART - 2), substr($0, RSTART + 2); next }
+        /^\[/ {
+            if (match($0, /\]:[0-9]+(%[^ \]]+)?$/)) {
+                addr = substr($0, 2, RSTART - 2); port = substr($0, RSTART + 2)
+                if ((i = index(port, "%")) > 0) { addr = addr substr(port, i); port = substr(port, 1, i - 1) }
+                print addr, port
+            }
+            next
+        }
         { if (split($0, f, ":") == 2) print f[1], f[2] }'
 }
 
@@ -138,9 +149,10 @@ sshd_endpoints_configured() {
 # Returns 1 and prints nothing when ssh.socket is not active. Otherwise the
 # ports in its Listen=, one per line: `systemctl show -p Listen` prints one
 # "<address> (<type>)" per line, "0.0.0.0:22 (Stream)", "[::]:22 (Stream)",
-# "[fe80::1%eth0]:22 (Stream)" for a scoped IPv6 address, or a bare "22".
-# The port is the digits after the last ':' (or the whole field when it is
-# only digits). Only "(Stream)" (TCP) lines count, so a ListenDatagram
+# "[fe80::1]:22%eth0 (Stream)" for a scoped IPv6 address (the scope after
+# the port, unlike sshd -T), or a bare "22". The port is the digits after
+# the last ':' up to any '%' (or the whole field when it is only digits).
+# Only "(Stream)" (TCP) lines count, so a ListenDatagram
 # cannot add a port; a unix socket path ("/run/x.sock", or "@name" for an
 # abstract one) is skipped by its first character, since a path may end in
 # ":<digits>" too.

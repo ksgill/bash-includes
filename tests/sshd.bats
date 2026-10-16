@@ -144,7 +144,7 @@ teardown() {
 
 @test "sshd_ports_socket: the Stream ports of an active ssh.socket, scope suffix stripped; nothing and 1 when inactive" {
     [ "$(sshd_ports_socket)" = 22 ]
-    printf '[::]:2222 (Stream)\n[fe80::1%%eth0]:2223 (Stream)\n2224 (Stream)\n0.0.0.0:514 (Datagram)\n/run/x.sock (Stream)\n/run/odd:5 (Stream)\n@abstract:7 (Stream)\n' > "${TMP}/socket-listen"
+    printf '[::]:2222 (Stream)\n[fe80::1]:2223%%eth0 (Stream)\n2224 (Stream)\n0.0.0.0:514 (Datagram)\n/run/x.sock (Stream)\n/run/odd:5 (Stream)\n@abstract:7 (Stream)\n' > "${TMP}/socket-listen"
     [ "$(sshd_ports_socket | paste -sd ' ')" = "2222 2223 2224" ]
     [ "$(sshd_endpoints_socket | paste -sd '|')" = "* 2224|:: 2222|fe80::1%eth0 2223" ]
     rm -f "${TMP}/socket-active"
