@@ -151,6 +151,23 @@ _apt_update_quiet() {
     { APT_WAIT_NOTICE_FD=3 apt_update_wait -qq >/dev/null 2>&1; } 3>&1 || true
 }
 
+# ── _apt_present <path> ───────────────────────────────────────────────────────
+# Is <path> a regular file? 0 yes, 1 no, 2 it could not be told. The apt
+# directories are 0755 on every supported release, so the plain test answers
+# and costs no sudo call; behind a directory the invoking user cannot search
+# the question is put to root through backup.sh's _backup_exists when that
+# is loaded, because an unprivileged test answers "absent" for a file it
+# merely cannot see, and "absent" here means writing a sources file over one
+# that is already right, or removing nothing (FA-bash-includes-012). Without
+# backup.sh the plain test is all there is.
+_apt_present() {
+    if declare -f _backup_exists >/dev/null 2>&1; then
+        _backup_exists -f "$1"
+    else
+        [[ -f "$1" ]]
+    fi
+}
+
 # _apt_backup <file> <reason> — backup_file, when backup.sh is loaded, leaving
 # the path it chose (.orig or .bak) in _APT_BACKUP_DEST; empty when backup.sh
 # is not loaded or there is no file. apt reads only *.list and *.sources from
@@ -159,12 +176,16 @@ _apt_update_quiet() {
 #
 # backup_file dies when the copy fails. It is run in a subshell here so that
 # this returns non-zero instead, and the caller can give its own status.
+# A file whose presence root alone could tell and did not (_apt_present 2)
+# is a backup failure too: skipping the backup would be the silent path.
 _APT_BACKUP_DEST=""
 _apt_backup() {
-    local f="$1" had_orig=false
+    local f="$1" had_orig=false present=0
     _APT_BACKUP_DEST=""
     declare -f backup_file >/dev/null 2>&1 || return 0
-    [[ -f "$f" ]] || return 0
+    _apt_present "$f" || present=$?
+    (( present != 1 )) || return 0
+    (( present == 0 )) || return 1
     if [[ -e "${f}.orig" ]]; then
         had_orig=true
     fi
@@ -382,13 +403,28 @@ apt_repo_keyring_pinned() {
 #     W: The repository '<uri> <suite> Release' does not have a Release file.
 #        (with Acquire::AllowInsecureRepositories=1; with it forced back to
 #        0 on the command line, as the validation does, both are E: again)
+#   produced by apt 2.6.1 (Debian 12, a chroot on 2026-10-17; the repository
+#   a local file: one, signed by a key not in the keyring, by a key whose
+#   signature was tampered with, by a key that had expired, and not at all):
+#     Err:1 file:<path> bookworm InRelease
+#       The following signatures couldn't be verified because the public key
+#       is not available: NO_PUBKEY <id>
+#     W: GPG error: file:<path> bookworm InRelease: The following signatures
+#        couldn't be verified because the public key is not available:
+#        NO_PUBKEY <id>
+#     W: GPG error: file:<path> bookworm InRelease: The following signatures
+#        were invalid: BADSIG <id> <uid>
+#     W: GPG error: file:<path> bookworm InRelease: The following signatures
+#        were invalid: EXPKEYSIG <id> <uid>
+#     E: The repository 'file:<path> bookworm InRelease' is not signed.
+#        (after each of the three, exit status 100)
+#     E: The repository 'file:<path> bookworm Release' is not signed.
+#        (no signature at all, with AllowInsecureRepositories forced to 0)
+#   2.9.32 replaced "GPG error" with "OpenPGP signature verification failed"
+#   (apt's changelog); the tokens after it are the same.
 #   present in apt 3.2.0's binaries (libapt-pkg, the gpgv method), not
-#   produced here:
-#     EXPKEYSIG; BADSIG; "The following signatures were invalid";
+#   produced on either version:
 #     "An error occurred during the signature verification"
-#   from apt's changelog only (2.9.32 replaced it with "OpenPGP signature
-#   verification failed"), for apt before that:
-#     W: GPG error: <uri> <suite> InRelease: …
 #
 # A signature or connection warning counts even when apt exits 0: apt keeps
 # using old index files after a signature failure it calls transient, and an
@@ -640,7 +676,16 @@ apt_add_repo() {
     fi
 
     # ── Existing keyring: must still pass the check ──────────────────────────
-    if [[ -n "$fprs" && -f "$keyring" ]] && ! _apt_installed_keyring_matches "$keyring" "$fprs"; then
+    # Presence tested as _apt_present says; a question root did not answer
+    # ends the call before anything is written.
+    local have_keyring=0 have_sources=0
+    _apt_present "$keyring" || have_keyring=$?
+    _apt_present "$sources" || have_sources=$?
+    if (( have_keyring == 2 || have_sources == 2 )); then
+        log_error "APT repo '${name}': could not find out whether ${keyring} and ${sources} exist (sudo gave no answer); nothing was changed"
+        return 2
+    fi
+    if [[ -n "$fprs" ]] && (( have_keyring == 0 )) && ! _apt_installed_keyring_matches "$keyring" "$fprs"; then
         local aside
         aside="${keyring}.untrusted.$(date +%s)"
         log_warn "APT repo '${name}': ${keyring} is not the pinned key (${fprs}); moving it to ${aside}"
@@ -648,17 +693,18 @@ apt_add_repo() {
             log_error "APT repo '${name}': could not move the unpinned keyring ${keyring} aside; it is still in place and apt still trusts it"
             return 2
         fi
+        have_keyring=1
         if declare -f journal_record >/dev/null 2>&1; then
             journal_record modify "$keyring" "moved aside: not the pinned key for ${name}" "moved_to=${aside}"
         fi
     fi
 
     # ── Already configured correctly? ────────────────────────────────────────
-    if [[ -f "$sources" ]]; then
+    if (( have_sources == 0 )); then
         if grep -qxF "URIs: ${uris}"        "$sources" 2>/dev/null && \
            grep -qxF "Suites: ${suites}"    "$sources" 2>/dev/null && \
            grep -qxF "Signed-By: ${keyring}" "$sources" 2>/dev/null && \
-           [[ -f "$keyring" ]]; then
+           (( have_keyring == 0 )); then
             log_info "APT repo '${name}' already configured for '${suites}'"
             return 0
         fi
@@ -680,7 +726,7 @@ apt_add_repo() {
         fi
     fi
 
-    if [[ ! -f "$keyring" ]]; then
+    if (( have_keyring != 0 )); then
         log_info "Fetching signing key for '${name}'"
         # Download to a private temporary file, check it, and only then put it
         # in place: nothing unchecked ever lands in the keyring directory.
@@ -768,7 +814,11 @@ apt_add_repo() {
     # — an error. Without it apt exits 0 with only W: lines, and a repository
     # that was never reached would pass. An apt that does not know the option
     # ignores it, as it does any unknown configuration key, so the W: lines
-    # are tested for as well (_apt_validation_class).
+    # are tested for as well (_apt_validation_class). Both this option and
+    # the two below behave the same on apt 3.2.0 (Ubuntu 26.04) and apt 2.6.1
+    # (Debian 12): a refused connection is E: and status 100 with Error-Mode,
+    # W: and status 0 without; an unsigned repository is E: with the
+    # insecure options forced off (checked 2026-10-17 in a Debian 12 chroot).
     #
     # Acquire::AllowInsecureRepositories and …DowngradeToInsecureRepositories
     # are forced off for this one update: a host configured to accept
@@ -897,15 +947,27 @@ apt_remove_repo() {
         esac
     done
 
-    local name="${1:-}" f what updated=false
+    local name="${1:-}" f what updated=false present=0
     [[ -n "$name" ]] || die "apt_remove_repo: name is required"
     _apt_repo_name_ok "$name" \
         || die "apt_remove_repo: '${name}' is not a usable repo name (letters, digits, '.', '_' and '-', starting with a letter or digit)"
     local keyring="${APT_KEYRING_DIR}/${name}.gpg"
     local sources="${APT_SOURCES_DIR}/${name}.sources"
 
+    # Both presences first, so an answer root did not give leaves both files
+    # in place, not one of them removed.
+    local -a found=()
     for f in "$sources" "$keyring"; do
-        [[ -f "$f" ]] || continue
+        present=0
+        _apt_present "$f" || present=$?
+        (( present != 1 )) || continue
+        if (( present != 0 )); then
+            log_error "Could not find out whether ${f} exists (sudo gave no answer); nothing was removed"
+            return 1
+        fi
+        found+=("$f")
+    done
+    for f in "${found[@]}"; do
         if [[ "$f" == "$keyring" ]]; then
             [[ "$keep_key" == false ]] || continue
             what="removed the signing key of APT repo ${name}"

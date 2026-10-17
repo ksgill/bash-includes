@@ -202,7 +202,14 @@ _backup_dir_owner() {
 #
 # A symlink is backed up as the file it points to: the backup is a copy of the
 # content, with the target's mode, owner and timestamps, never a second link
-# to the same target, which would change along with it. The copy is written
+# to the same target, which would change along with it. That holds when the
+# target is outside the link's own directory too, a link in /etc into a
+# root-only directory included (FA-bash-includes-012, decided 2026-10-17):
+# what the caller is about to modify through the link is the target's
+# content, so that is what the backup must hold; the copy keeps the target's
+# own mode and owner, so a root-only target stays root-only beside the link,
+# and the link's directory has already passed _backup_dir_closed, so no
+# less-trusted account can read the copy from there. The copy is written
 # at the backup's own path or not at all: a file or link already there is
 # replaced, not written through, and if that path is a directory (or, with a
 # cp that will not replace it, a link to one) the copy fails and this dies —

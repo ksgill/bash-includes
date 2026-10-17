@@ -23,11 +23,10 @@
 # wireguard-bld (FA-fleet-020), which had each been fixed twice for the same
 # bug. Two of them carry the VPN builders' convention rather than a fact
 # about nft: the family detection looks at tables named "filter" and
-# prefers inet on a tie, and the policy query treats a chain named
-# "forward" specially (a chain named "input" is still picked by name alone;
-# a base chain named input on another hook reports that hook's policy). A
-# consumer with another layout passes its own table name to the queries
-# that take one and does not use the detection.
+# prefers inet on a tie, and the policy query expects a base chain to sit
+# on the hook it is named after unless told otherwise (--arg h). A consumer
+# with another layout passes its own table name to the queries that take
+# one, its hook to the policy query, and does not use the detection.
 #
 # What a caller has to bring:
 # - The exit status of nft and of jq. Every program prints nothing, exit 0,
@@ -69,16 +68,22 @@ _NFT_FWD_OTHERS_JQ='def c: tostring | gsub("[[:cntrl:]]"; "?");
      | select(($f == "ip" and .family == "ip6") | not)
      | "\(.family | c) \(.table | c)/\(.name | c)"] | unique | join(", ")'
 
-# _NFT_POLICY_JQ, with --arg f <family> --arg t <table> --arg n <chain>:
-# "missing" when the table has no such chain, otherwise its policy ("accept",
-# "drop"), or "none" for a regular (non-base) chain. A chain named forward
-# that is a base chain on any hook but forward (input, say) is "none" too:
-# it is picked by name, and its policy is not the forward policy, so it must
-# never be flipped. (Only for forward: an input chain is name-based.)
+# _NFT_POLICY_JQ, with --arg f <family> --arg t <table> --arg n <chain> and
+# optionally --arg h <hook>: "missing" when the table has no such chain,
+# otherwise its policy ("accept", "drop"), or "none" for a regular (non-base)
+# chain and for a base chain on any hook but the expected one. The expected
+# hook is <hook> when given, else the chain's own name — the convention the
+# consumers' filter tables follow (input on input, forward on forward) — so
+# a chain named forward that is a base chain on the input hook, or one named
+# input on the output hook, is "none": it is picked by name, and its policy
+# is not the policy of the hook the caller means, so it must never be
+# reported as such or flipped (FA-bash-includes-018). A caller whose base
+# chain is not named after its hook (iptables-nft's FORWARD, say) passes
+# --arg h forward.
 _NFT_POLICY_JQ='[.nftables[] | .chain? // empty
      | select(.family == $f and .table == $t and .name == $n)]
     | if length == 0 then "missing"
-      elif $n == "forward" and (.[0].hook // "") != "forward" then "none"
+      elif (.[0].hook // "") != ($ARGS.named.h // $n) then "none"
       else (.[0].policy // "none") end'
 
 # _NFT_DETECT_FAMILY_JQ, over `nft -j list ruleset`: the family ("inet" or

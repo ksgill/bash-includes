@@ -52,9 +52,11 @@ oui_lookup() {
     oui="$(oui_normalize "${1:-}")" || return 1
     formatted="$(oui_format "$oui")"
 
-    # -F and an anchor via grep -m1 on the literal prefix: records start with
-    # the formatted OUI, so a fixed-string match is both correct and faster.
-    grep -m1 "^${formatted}" "$OUI_FILE" || {
+    # A literal match anchored at the start of the line: records start with
+    # the formatted OUI. awk's index() takes the prefix as text, where grep
+    # would read it as a pattern and -F cannot anchor (FA-bash-includes-014).
+    # The record is printed and the search stops at the first one.
+    awk -v p="${formatted}" 'index($0, p) == 1 { print; found = 1; exit } END { exit !found }' "$OUI_FILE" || {
         log_warn "No vendor registered for OUI ${formatted}"
         return 1
     }

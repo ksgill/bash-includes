@@ -53,9 +53,21 @@ q() { jq -r "$@" <<< "$RS"; }
 @test "policy: a chain named forward that is a base chain on another hook is none, never its policy" {
     local rs='{"nftables":[{"chain":{"family":"inet","table":"filter","name":"forward","handle":3,"type":"filter","hook":"input","prio":0,"policy":"drop"}}]}'
     [ "$(jq -r --arg f inet --arg t filter --arg n forward "$_NFT_POLICY_JQ" <<< "$rs")" = none ]
-    # The same shape for an input chain is name-based: its policy is reported.
+    # The same for input: a base chain named input on another hook is not
+    # the input policy (FA-bash-includes-018); on its own hook it is.
     rs='{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","handle":3,"type":"filter","hook":"prerouting","prio":0,"policy":"drop"}}]}'
+    [ "$(jq -r --arg f inet --arg t filter --arg n input "$_NFT_POLICY_JQ" <<< "$rs")" = none ]
+    rs='{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","handle":3,"type":"filter","hook":"input","prio":0,"policy":"drop"}}]}'
     [ "$(jq -r --arg f inet --arg t filter --arg n input "$_NFT_POLICY_JQ" <<< "$rs")" = drop ]
+}
+
+@test "policy: --arg h names the expected hook for a chain not named after it; a regular chain is none whatever h says" {
+    # iptables-nft's FORWARD sits on the forward hook under another name.
+    [ "$(q --arg f ip --arg t filter --arg n FORWARD "$_NFT_POLICY_JQ")" = none ]
+    [ "$(q --arg f ip --arg t filter --arg n FORWARD --arg h forward "$_NFT_POLICY_JQ")" = accept ]
+    [ "$(q --arg f ip --arg t filter --arg n FORWARD --arg h input "$_NFT_POLICY_JQ")" = none ]
+    [ "$(q --arg f inet --arg t filter --arg n obt-input --arg h input "$_NFT_POLICY_JQ")" = none ]
+    [ "$(q --arg f inet --arg t filter --arg n forward --arg h forward "$_NFT_POLICY_JQ")" = accept ]
 }
 
 @test "policy: a forged chain line in a rule comment is not a chain" {

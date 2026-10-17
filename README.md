@@ -31,7 +31,7 @@ lib/oui.sh            MAC vendor lookup
 lib/mac.sh            read an interface's MAC address; set it and read it back, in this or another network namespace
 lib/netdev.sh         an interface's existence, IFF_UP state and wireless phy; the modes a phy supports
 lib/nft.sh            jq programs over nft's JSON listings: chain policy, other forward users, filter family, jump handles
-lib/sshd.sh           the SSH ports sshd is configured for (sshd -T), ssh.socket listens on, and sshd actually holds (ss)
+lib/sshd.sh           the SSH ports and endpoints sshd is configured for (sshd -T), ssh.socket listens on, and sshd actually holds (ss); an endpoint's nft address match
 lib/git.sh            git identity, GitHub ssh stanza, pinned host key
 bin/provision-report  read and verify the change journal
 bin/bld               resolve # include: directives into a self-contained script
@@ -447,6 +447,62 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.14.0
+
+The open library findings after v1.13.0, each closed where the consumers
+can take it up on their next re-pin.
+
+- **`sshd.sh`: a port is not an endpoint, now with the tooling to act on
+  it.** `sshd_endpoints_listening [socket-port...]` joins
+  `sshd_endpoints_configured` and `sshd_endpoints_socket`, so every source
+  reads `<address> <port>` (`ss` prints a scoped address as
+  `[fe80::1]%eth0:22` and an IPv6 any-address socket that takes IPv4 as
+  `*:22`; both are parsed). `sshd_endpoint_match <family> <address>` turns
+  an address into the match a `tcp dport` rule carries in a table of that
+  family: nothing for `*` (a dual-stack any-address socket: port-wide),
+  `meta nfproto ipv4 ` / `meta nfproto ipv6 ` for `0.0.0.0` / `::` in an
+  inet table and nothing in the table of their own family (an any-address
+  listener of one family must not open the port for the other, where a
+  local user's own listener would sit), `ip daddr <a> ` or `ip6 daddr
+  <a> ` for an address, `iifname "<dev>" ` in front of any of those for a
+  scoped or device-bound listener; status 2 when the family cannot reach
+  the address (IPv6 in an ip table), 1 for anything that is not an address
+  by the grammar (checked under the C locale: canonical octets, eight
+  groups or one `::`, an interface name), with the fail-safe reading for
+  the caller written in the header, so nothing unchecked is ever pasted
+  into a rule. The validators the consumers were calling by
+  their private names are public: `sshd_valid_ports` and
+  `sshd_valid_endpoints` (FA-bash-includes-017; `_sshd_valid_ports` is
+  gone, re-pin and rename).
+
+- **`nft.sh`: `_NFT_POLICY_JQ` expects a base chain on the hook it is named
+  after** (FA-bash-includes-018). A chain named `input` on the output hook,
+  or a regular chain named `input`, reported its own policy as the input
+  policy; now it is `none`, as a chain named `forward` on another hook
+  already was. `--arg h <hook>` names the hook for a chain not named after
+  it (iptables-nft's `FORWARD`). Callers that query `input` and `forward`
+  need no change.
+
+- **`oui.sh`: `oui_lookup` matches the prefix as text at the start of the
+  line** with awk's `index()`, as its comment claimed `grep -F` did
+  (FA-bash-includes-014); the first record wins, as before.
+
+- **`apt.sh`: the existence tests on the sources file and keyring go
+  through `backup.sh`'s `_backup_exists`** when backup.sh is loaded
+  (`_apt_present`), so a file behind a directory the invoking user cannot
+  search is asked of root instead of read as absent, which would have
+  rewritten a repository that was already right or removed nothing; a
+  question root does not answer is status 2 from `apt_add_repo`, 1 from
+  `apt_remove_repo`, with nothing written or removed (FA-bash-includes-012
+  item 7).
+  Items 4 and 5 of the same finding are closed by a run, not a change: in a
+  Debian 12 chroot (apt 2.6.1) the validation's three options behave as on
+  apt 3.2.0, and the `NO_PUBKEY`, `BADSIG`, `EXPKEYSIG` and `GPG error`
+  lines the classifier matches were produced and classed `signature`; the
+  lines are in the header. Item 2 is decided, not changed: a link's target
+  is backed up wherever it is, with its own mode and owner (the reason is in
+  `backup_file`'s comment).
 
 ## Changes in v1.13.0
 

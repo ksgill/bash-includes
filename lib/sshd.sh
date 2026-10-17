@@ -29,8 +29,9 @@
 #    alongside it (only the wildcard bind conflicts) and is then reachable
 #    from outside on a port the operator thinks is SSH. For ports below 1024
 #    that needs root; above, nothing. The *_endpoints_* functions give the
-#    address with the port so the rule can carry `ip daddr <a>` / `ip6 daddr
-#    <a>` when the address is not a wildcard (0.0.0.0, ::, or *).
+#    address with the port, and sshd_endpoint_match turns the address into
+#    the `ip daddr <a>` / `ip6 daddr <a>` match the rule carries when the
+#    address is not a wildcard (0.0.0.0, ::, or *).
 #
 # Lifted from openvpn-bld, wireguard-bld and sys-bld, which carried three
 # readers of the same output (FA-fleet-020).
@@ -59,30 +60,37 @@ _sshd_root() {
     fi
 }
 
-# ── _sshd_valid_ports ─────────────────────────────────────────────────────────
+# ── sshd_valid_ports ──────────────────────────────────────────────────────────
 # stdin: candidate ports, one per line, anything; stdout: the ones that are a
-# whole number from 1 to 65535, as plain decimals, sorted and unique.
-_sshd_valid_ports() {
+# whole number from 1 to 65535, as plain decimals, sorted and unique. The
+# filter every function here ends in; public because a caller that unions
+# two sources needs the same one (the VPN builders do; FA-bash-includes-017).
+sshd_valid_ports() {
     awk '$1 ~ /^[0-9]+$/ && $1 + 0 >= 1 && $1 + 0 <= 65535 { print $1 + 0 }' | sort -nu
 }
 
-# ── _sshd_valid_endpoints ─────────────────────────────────────────────────────
+# ── sshd_valid_endpoints ──────────────────────────────────────────────────────
 # stdin: "<address> <port>" lines; stdout: those whose port is valid, the port
-# as a plain decimal, sorted and unique.
-_sshd_valid_endpoints() {
+# as a plain decimal, sorted and unique (C collation, so the order is the
+# same on every host). The endpoint counterpart of sshd_valid_ports.
+sshd_valid_endpoints() {
     awk 'NF == 2 && $2 ~ /^[0-9]+$/ && $2 + 0 >= 1 && $2 + 0 <= 65535 { print $1, $2 + 0 }' | LC_ALL=C sort -u
 }
 
 # ── _sshd_split_endpoint <address:port form> ──────────────────────────────────
-# stdin: one "<addr>:<port>" per line as sshd -T and systemd print them —
-# "0.0.0.0:22", "[::]:22", a bare "22" (systemd's ListenStream=22), and a
-# scoped link-local address in either tool's form: sshd -T puts the scope
-# inside the brackets, "[fe80::1%eth0]:22"; systemd puts it after the port,
+# stdin: one "<addr>:<port>" per line as sshd -T, systemd and ss print them —
+# "0.0.0.0:22", "[::]:22", "*:22" (ss, for an IPv6 any-address socket that
+# takes IPv4 too), a bare "22" (systemd's ListenStream=22), and a scoped
+# link-local address in each tool's form: sshd -T puts the scope inside the
+# brackets, "[fe80::1%eth0]:22"; systemd puts it after the port,
 # "[fe80::1]:22%eth0" (systemd.socket(5): "[x]:y%dev"; systemd 259 rejects
-# the other form) — stdout: "<address> <port>", brackets removed, the scope
-# on the address either way ("fe80::1%eth0 22"), "*" for a bare port. An
-# unbracketed IPv6 or a portless address prints nothing: the port cannot be
-# told from the address, and neither tool prints those forms.
+# the other form); ss puts it between the bracket and the port,
+# "[fe80::1]%eth0:22" (iproute2 ss.c, inet_addr_print: "%s%%%s" after the
+# bracketed address, then the ":" delimiter) — stdout: "<address> <port>",
+# brackets removed, the scope on the address whichever way it came
+# ("fe80::1%eth0 22"), "*" for a bare port. An unbracketed IPv6 or a
+# portless address prints nothing: the port cannot be told from the address,
+# and none of the tools prints those forms.
 _sshd_split_endpoint() {
     awk '
         /^[0-9]+$/ { print "*", $0; next }
@@ -91,10 +99,127 @@ _sshd_split_endpoint() {
                 addr = substr($0, 2, RSTART - 2); port = substr($0, RSTART + 2)
                 if ((i = index(port, "%")) > 0) { addr = addr substr(port, i); port = substr(port, 1, i - 1) }
                 print addr, port
+            } else if (match($0, /\]%[^ :\]]+:[0-9]+$/)) {
+                addr = substr($0, 2, RSTART - 2); rest = substr($0, RSTART + 1)
+                i = index(rest, ":"); print addr substr(rest, 1, i - 1), substr(rest, i + 1)
             }
             next
         }
         { if (split($0, f, ":") == 2) print f[1], f[2] }'
+}
+
+# ── sshd_endpoint_match <family> <address> ────────────────────────────────────
+# The nftables match that confines an accept rule to one listener's address:
+# rule 2 above, in one place for every consumer that writes `tcp dport`
+# rules from an *_endpoints_* reader. <family> is the family of the table the
+# rule goes in (inet, ip or ip6); <address> is one as the readers print it.
+# Prints the match to put before `tcp dport <port>`, with a trailing space,
+# or nothing for a wildcard; the status says whether a rule is due at all:
+#
+#   0  print what came out, before `tcp dport <port>`:
+#      - "" for "*": the listener takes every address of both families
+#        (ss prints an IPv6 any-address socket without IPV6_V6ONLY as "*";
+#        a bare systemd ListenStream=<port> is one), so the rule is
+#        port-wide.
+#      - "meta nfproto ipv4 " for 0.0.0.0 in an inet table, "" in an ip
+#        one; "meta nfproto ipv6 " for :: (and its spellings
+#        0:0:0:0:0:0:0:0, ::ffff:0.0.0.0 is 0.0.0.0) in inet, "" in ip6.
+#        An any-address listener of one family is still a wildcard for
+#        that family only: a port-wide inet rule for sshd's 0.0.0.0:2222
+#        would let a local user's own [::]:2222 (IPV6_V6ONLY, which the
+#        kernel allows beside it) be reached from outside, rule 2 again.
+#        Every "::" these readers see is IPv6-only: sshd sets IPV6_V6ONLY
+#        on its sockets (which is why `sshd -T` prints 0.0.0.0 beside ::),
+#        Ubuntu's ssh.socket carries BindIPv6Only=ipv6-only, and ss prints
+#        a dual-stack any socket as "*". A socket unit set to
+#        BindIPv6Only=both shows "[::]" in Listen= and "*" in ss, and the
+#        union of rule 1 carries the "*".
+#      - "ip daddr 10.8.0.1 " for an IPv4 address, "ip6 daddr 2001:db8::1 "
+#        for an IPv6 one, and for a scoped address the interface in front,
+#        'iifname "eth0" ip6 daddr fe80::1 ', since a link-local address is
+#        one per link and nft has no scope match. A wildcard with a scope
+#        (ss prints a socket bound to a device with SO_BINDTODEVICE as
+#        "0.0.0.0%eth0:22" or "[::]%eth0:22") gets the same iifname in
+#        front of its family match: that listener takes connections on that
+#        link only. (For a VRF master the input hook may see the enslaved
+#        port as iifname; the unscoped wildcard that sshd -T and Listen=
+#        report for the same listener keeps the port open through the
+#        union.) An IPv4-mapped IPv6 address (::ffff:10.8.0.1, how an IPv6
+#        socket that takes IPv4 names an IPv4 listener) is matched as the
+#        IPv4 address.
+#   2  the address, or the family wildcard, cannot be reached through a
+#      table of that family (an IPv6 address or :: and family ip; IPv4 or
+#      0.0.0.0 and ip6): the caller writes no rule for it there. That is
+#      safe: a table of one family never sees the other's packets, so a
+#      rule left out of it cannot lock anyone out.
+#   1  not an address this function understands (a hostname, a malformed
+#      literal, a scope that is not an interface name — an all-digit scope
+#      is an interface index, which nft cannot take, and a name with a
+#      character outside the class below): nothing printed, and the text
+#      must not be pasted into a rule. The fail-safe reading for the caller
+#      is a port-wide rule for that port, or no drop policy at all (rule
+#      1): dropping the listener would be the lockout direction.
+#
+# The output is pasted into an nft command by the caller, so the address and
+# the interface name are checked against the grammar first, under the C
+# locale (a bracket range in another locale matches more than ASCII): dotted
+# decimal with four canonical octets 0-255 (no leading zero: glibc rejects
+# it and nft would read it another way); eight hexadecimal groups of 1-4
+# digits, or fewer with exactly one "::"; an interface name of 1-15
+# characters from [A-Za-z0-9_.-] that is not "." or ".." and not all
+# digits. Case is kept as given; nft accepts either. Two spellings of one
+# address (case, a mapped form beside the plain one) give two rules; a
+# caller that minds runs its rule lines through `sort -u`.
+sshd_endpoint_match() {
+    local LC_ALL=C family="${1:-}" addr="${2:-}" scope="" prefix="" o parts=0
+    local h='[0-9A-Fa-f]{1,4}'
+    case "${family}" in inet|ip|ip6) ;; *) return 1 ;; esac
+    if [[ "${addr}" == *%* ]]; then
+        scope="${addr#*%}"; addr="${addr%%%*}"
+        [[ "${scope}" =~ ^[A-Za-z0-9_.-]{1,15}$ && "${scope}" != . && "${scope}" != .. ]] || return 1
+        [[ ! "${scope}" =~ ^[0-9]+$ ]] || return 1
+        prefix="iifname \"${scope}\" "
+    fi
+    if [[ "${addr}" == '*' ]]; then
+        printf '%s\n' "${prefix}"
+        return 0
+    fi
+    # The family wildcards, after the grammar checks below: "" in a table
+    # of their own family, a protocol match in inet, 2 in the other family.
+    local v4_any='' v6_any=''
+    case "${family}" in inet) v4_any='meta nfproto ipv4 '; v6_any='meta nfproto ipv6 ' ;; esac
+    # An IPv4-mapped address names an IPv4 listener.
+    if [[ "${addr}" =~ ^::[Ff][Ff][Ff][Ff]:([0-9.]+)$ ]]; then
+        addr="${BASH_REMATCH[1]}"
+    fi
+    if [[ "${addr}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for o in "${BASH_REMATCH[@]:1:4}"; do
+            [[ "${o}" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( o <= 255 )) || return 1
+        done
+        [[ "${family}" != ip6 ]] || return 2
+        if [[ "${addr}" == 0.0.0.0 ]]; then
+            printf '%s%s\n' "${prefix}" "${v4_any}"
+            return 0
+        fi
+        printf '%sip daddr %s \n' "${prefix}" "${addr}"
+        return 0
+    fi
+    if [[ "${addr}" == *::* ]]; then
+        [[ "${addr}" =~ ^(${h}(:${h})*)?::(${h}(:${h})*)?$ ]] || return 1
+        # Groups present: the "::" stands for at least one, so at most 7.
+        o="${addr//::/:}"; o="${o#:}"; o="${o%:}"; parts="${o//:/}"
+        [[ -z "${o}" ]] && parts=0 || parts=$(( ${#o} - ${#parts} + 1 ))
+        (( parts <= 7 )) || return 1
+    else
+        [[ "${addr}" =~ ^${h}(:${h}){7}$ ]] || return 1
+    fi
+    [[ "${family}" != ip ]] || return 2
+    if [[ "${addr}" =~ ^[0:]+$ ]]; then
+        printf '%s%s\n' "${prefix}" "${v6_any}"
+        return 0
+    fi
+    printf '%sip6 daddr %s \n' "${prefix}" "${addr}"
+    return 0
 }
 
 # ── sshd_master_pid ───────────────────────────────────────────────────────────
@@ -126,7 +251,7 @@ sshd_master_pid() {
 sshd_ports_configured() {
     local out=""
     out="$(sshd_endpoints_configured)" || return 1
-    awk '{ print $2 }' <<< "${out}" | _sshd_valid_ports
+    awk '{ print $2 }' <<< "${out}" | sshd_valid_ports
 }
 
 # ── sshd_endpoints_configured ─────────────────────────────────────────────────
@@ -142,7 +267,7 @@ sshd_endpoints_configured() {
         $1 == "port" { ports[++np] = $2 }
         $1 == "listenaddress" { la = 1; print $2 }
         END { if (!la) for (i = 1; i <= np; i++) print ports[i] }' <<< "${out}" \
-        | _sshd_split_endpoint | _sshd_valid_endpoints
+        | _sshd_split_endpoint | sshd_valid_endpoints
 }
 
 # ── sshd_ports_socket ─────────────────────────────────────────────────────────
@@ -163,7 +288,7 @@ sshd_endpoints_configured() {
 sshd_ports_socket() {
     local out=""
     out="$(sshd_endpoints_socket)" || return 1
-    awk '{ print $2 }' <<< "${out}" | _sshd_valid_ports
+    awk '{ print $2 }' <<< "${out}" | sshd_valid_ports
 }
 
 # ── sshd_endpoints_socket ─────────────────────────────────────────────────────
@@ -176,7 +301,7 @@ sshd_endpoints_socket() {
     systemctl is-active --quiet ssh.socket 2>/dev/null || return 1
     listen="$(systemctl show ssh.socket -p Listen --value 2>/dev/null)" || listen=""
     awk '$NF == "(Stream)" && $1 !~ /^[\/@]/ { print $1 }' <<< "${listen}" \
-        | _sshd_split_endpoint | _sshd_valid_endpoints
+        | _sshd_split_endpoint | sshd_valid_endpoints
 }
 
 # ── sshd_ports_listening [<ssh.socket port>...] ───────────────────────────────
@@ -189,13 +314,33 @@ sshd_endpoints_socket() {
 # per-session process is named sshd too, so its X11 and 'ssh -R' forwarding
 # listeners would count.
 # Each ss line is "State Recv-Q Send-Q Local Peer Process", Local as
-# addr:port ("0.0.0.0:22", "[::]:22", "*:22"), Process as
-# users:(("<name>",pid=<N>,fd=<M>),...). ss prints <name> unescaped, so a
+# addr:port ("0.0.0.0:22", "[::]:22", "*:22", "[fe80::1]%eth0:22"), Process
+# as users:(("<name>",pid=<N>,fd=<M>),...). ss prints <name> unescaped, so a
 # name can carry a forged ',pid=<N>,fd=<M>'; a pid counts only when ',fd=<M>'
 # is followed by ')', and a name cannot contain ')' (ss reads it from
 # /proc/<pid>/stat and stops at the first ')'; iproute2 6.19.0).
 # A failing ss prints nothing (and so disagrees with any configured port).
 sshd_ports_listening() {
+    _sshd_listening_locals "$@" | _sshd_split_endpoint | awk '{ print $2 }' | sshd_valid_ports
+}
+
+# ── sshd_endpoints_listening [<ssh.socket port>...] ───────────────────────────
+# sshd_ports_listening with the address: "<address> <port>" per line as the
+# other *_endpoints_* functions print it, "*" for ss's any-address form. The
+# same listeners count, by the same pids.
+sshd_endpoints_listening() {
+    _sshd_listening_locals "$@" | _sshd_split_endpoint | sshd_valid_endpoints
+}
+
+# ── _sshd_listening_locals [<ssh.socket port>...] ─────────────────────────────
+# The Local field of every `ss -Htlnp` line that counts as an SSH listener
+# (the rule in sshd_ports_listening), one per line, as ss printed it. The
+# port is read off the end of the field here only to decide whether pid 1's
+# hold is on a socket port; the callers parse the field properly, through
+# _sshd_split_endpoint, so a Local form that function does not read drops
+# the listener from both the port and the endpoint set: keep the two in
+# step (every form ss prints is listed there).
+_sshd_listening_locals() {
     # IFS is local so "$*" joins the socket ports with a space whatever the
     # caller set it to; the awk index() below depends on that.
     local master="" ss_out="" IFS=' '
@@ -206,7 +351,6 @@ sshd_ports_listening() {
         { a = $4; sub(/.*:/, "", a)
           if (a !~ /^[0-9]+$/ || a + 0 < 1 || a + 0 > 65535) next
           p = a + 0
-          if (held_by(master)) print p
-          else if (held_by(1) && index(sock, " " p " ")) print p }' <<< "${ss_out}" \
-        | _sshd_valid_ports
+          if (held_by(master)) print $4
+          else if (held_by(1) && index(sock, " " p " ")) print $4 }' <<< "${ss_out}"
 }

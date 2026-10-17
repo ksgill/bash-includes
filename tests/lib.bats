@@ -1899,6 +1899,55 @@ STUB
     [ "$(_journal | wc -l)" -eq 0 ]
 }
 
+@test "_apt_present asks root through backup.sh's _backup_exists when it is loaded, else tests the file itself" {
+    _apt_env
+    : > "${TMP}/plain"
+    _backup_exists() { echo "asked $1 $2" >> "${TMP}/asked"; [[ "$2" == *answerless* ]] && return 2; [[ -f "$2" ]]; }
+    run _apt_present "${TMP}/plain"
+    [ "$status" -eq 0 ]
+    run _apt_present "${TMP}/absent"
+    [ "$status" -eq 1 ]
+    run _apt_present "${TMP}/answerless"
+    [ "$status" -eq 2 ]
+    [ "$(cat "${TMP}/asked")" = "asked -f ${TMP}/plain
+asked -f ${TMP}/absent
+asked -f ${TMP}/answerless" ]
+    unset -f _backup_exists
+    run _apt_present "${TMP}/plain"
+    [ "$status" -eq 0 ]
+    run _apt_present "${TMP}/absent"
+    [ "$status" -eq 1 ]
+}
+
+@test "apt_add_repo returns 2 and writes nothing when root gives no answer about the existing files" {
+    _apt_env; WGET_SERVES=a.asc
+    rm -f "$WGET_CALLED"
+    : > "${APT_STUB}/calls"
+    _backup_exists() { return 2; }
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"could not find out whether ${APT_KEYRING_DIR}/fixture.gpg and ${APT_SOURCES_DIR}/fixture.sources exist (sudo gave no answer); nothing was changed"* ]]
+    [ ! -e "${APT_SOURCES_DIR}/fixture.sources" ]
+    [ ! -e "${APT_KEYRING_DIR}/fixture.gpg" ]
+    [ ! -e "$WGET_CALLED" ]
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
+@test "apt_remove_repo returns 1 and removes nothing when root gives no answer about the files" {
+    _apt_env; WGET_SERVES=a.asc
+    run _add --fingerprint "$FPR_A"
+    [ "$status" -eq 0 ]
+    : > "${APT_STUB}/calls"
+    _backup_exists() { return 2; }
+    _then() { apt_remove_repo "$@" || echo "returned $?"; }
+    run _then fixture
+    [[ "$output" == *"returned 1"* ]]
+    [[ "$output" == *"Could not find out whether ${APT_SOURCES_DIR}/fixture.sources exists (sudo gave no answer); nothing was removed"* ]]
+    grep -qxF 'Suites: stable' "${APT_SOURCES_DIR}/fixture.sources"
+    cmp "${APTKEYS}/a.gpg" "${APT_KEYRING_DIR}/fixture.gpg"
+    [ "$(_calls | wc -l)" -eq 0 ]
+}
+
 @test "apt_add_repo records a validated repo even when the full update after it fails, and a re-run is a no-op" {
     _apt_env; WGET_SERVES=a.asc
     journal_init "test" "v1"
@@ -3241,6 +3290,17 @@ _row() { grep -E "  $1 +${TMP}/" <<< "$output" || true; }
 
     run oui_lookup ff:ff:ff:00:00:00
     [ "$status" -eq 1 ]
+
+    # The prefix is matched as text at the start of the line only: a record
+    # that merely contains it, before the real one, is not the answer, and
+    # only the first record is printed.
+    printf '%s\n' \
+        'DD-EE-FF   (hex)		Reseller of 00-11-22 parts' \
+        '00-11-22   (hex)		CIMSYS Inc' \
+        '00-11-22   (hex)		CIMSYS Inc duplicate' > "$OUI_FILE"
+    run oui_lookup 00:11:22:33:44:55
+    [ "$status" -eq 0 ]
+    [ "$output" = '00-11-22   (hex)		CIMSYS Inc' ]
 }
 
 @test "oui_vendor extracts just the organisation name" {
