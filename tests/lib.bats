@@ -2781,6 +2781,52 @@ _validation() {
     [ "$output" = '/etc/a\x1b[31mred' ]
 }
 
+@test "provision-report shows command= and selected_by= under a step record" {
+    journal_init "reporter" "v9"
+    journal_record step "install_nfs_server:ab12" "checklist step completed" \
+        "command=install_nfs_server /srv/share 10.0.0.0/24" \
+        "selected_by=profile:/etc/sys-bld/profiles/nas.profile"
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *$'\n            command: install_nfs_server /srv/share 10.0.0.0/24\n'* ]]
+    [[ "$output" == *$'\n            selected by: profile:/etc/sys-bld/profiles/nas.profile\n'* ]]
+    # The step line itself is unchanged: action, target, detail.
+    [[ "$output" == *"step     install_nfs_server:ab12"* ]]
+    [[ "$output" == *"checklist step completed"* ]]
+}
+
+@test "provision-report prints neither line for a record without the keys" {
+    journal_init "reporter" "v9"
+    printf 'x\n' > "${TMP}/plain.conf"
+    journal_record modify "${TMP}/plain.conf" "no extras"
+    journal_record step "only_command:cd34" "checklist step completed" "command=only_command"
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"selected by:"* ]]
+    [ "$(printf '%s\n' "$output" | grep -c '^ *command: ')" -eq 1 ]
+    # --raw and --targets are untouched by the display-only change.
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --targets
+    [ "$status" -eq 0 ]
+    [ "$output" = "${TMP}/plain.conf"$'\n'"only_command:cd34" ]
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report" --raw
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"command: "* && "$output" != *"selected by:"* ]]
+    [[ "$output" == *'"command":"only_command"'* ]]
+}
+
+@test "provision-report renders a hostile command= and selected_by= as one visible line each" {
+    journal_init "reporter" "v9"
+    journal_record step "s:ef56" "checklist step completed" \
+        $'command=f "a b" * \'q\'\nrm -rf /' \
+        $'selected_by=profile:/tmp/with space/*\033[31m.profile'
+    run env JOURNAL_FILE="$JOURNAL_FILE" NO_COLOR=1 "${BIN}/provision-report"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *$'\033'* ]]
+    [[ "$output" == *$'\n            command: f "a b" * \'q\'\\x0arm -rf /\n'* ]]
+    [[ "$output" == *$'\n            selected by: profile:/tmp/with space/*\\x1b[31m.profile\n'* ]]
+    [ "$(printf '%s\n' "$output" | grep -c 'rm -rf')" -eq 1 ]
+}
+
 @test "provision-report falls back to the default hash timeout for 0" {
     printf 'x\n' > "${TMP}/pub.conf"
     journal_init "reporter" "v9"

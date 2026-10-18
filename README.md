@@ -448,6 +448,18 @@ created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
 
+## Changes in v1.15.0
+
+- **`provision-report` shows what a step ran and who chose it.** A record
+  that carries a `command` or `selected_by` key (sys-bld writes both on
+  every checklist step since its `--step`/`--arg` command line: the
+  function and arguments that ran, and `profile:<path>` or `command-line`
+  for where the selection came from) prints them under the record as dim
+  `command:` and `selected by:` lines, through the same visible-escape
+  rendering as every other journalled string, so a value with a newline or
+  a terminal escape stays one line. Records without the keys, `--raw` and
+  `--targets` are unchanged; there is no new option.
+
 ## Changes in v1.14.0
 
 The open library findings after v1.13.0, each closed where the consumers

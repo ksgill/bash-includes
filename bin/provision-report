@@ -58,6 +58,12 @@ there, on its "backup:" line: [present], [missing], or [unknown] (existence
 cannot be determined, or the path is relative). Presence only; a backup's
 content is never read. This does not change the record's own status; missing
 backups are counted separately in the summary.
+
+A record that carries a "command" or "selected_by" key (sys-bld writes both
+on every checklist step: the function and arguments that ran, and whether a
+profile file or the command line selected the step) shows them under the
+record as "command:" and "selected by:" lines. Records without the keys
+print as before.
 HELP
 }
 
@@ -370,6 +376,11 @@ while IFS= read -r line; do
     version="$(jget "$line" version)"
     backup="$(jget "$line" backup)"
     sha="$(jget "$line" sha256_after)"
+    # Optional keys a caller adds with journal_record's key=value arguments.
+    # sys-bld writes both on every step record: the function and arguments
+    # that ran, and whether a profile file or the command line selected it.
+    command="$(jget "$line" command)"
+    selected_by="$(jget "$line" selected_by)"
 
     # Run header whenever the run id changes.
     if [[ "$run" != "$last_run" ]]; then
@@ -434,6 +445,8 @@ while IFS= read -r line; do
     printf '  %s%s  %-8s %s\n' "$status" "$(vis "${ts:0:19}")" "$(vis "$action")" "$(vis "$target")"
     [[ -n "$detail" ]] && printf '            %s%s%s\n' "$C_DIM" "$(vis "$detail")" "$C_RST"
     [[ -n "$backup" ]] && printf '            %sbackup: %s%s%s\n' "$C_DIM" "$(vis "$backup")" "$C_RST" "$backup_note"
+    [[ -n "$command" ]] && printf '            %scommand: %s%s\n' "$C_DIM" "$(vis "$command")" "$C_RST"
+    [[ -n "$selected_by" ]] && printf '            %sselected by: %s%s\n' "$C_DIM" "$(vis "$selected_by")" "$C_RST"
 done < "$JOURNAL_FILE"
 
 if [[ "$TARGETS" -eq 1 ]]; then
