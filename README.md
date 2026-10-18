@@ -450,6 +450,15 @@ through.
 
 ## Changes in v1.15.0
 
+- **CI lints the test suites.** `shell-ci.yml` gained a `shellcheck tests`
+  step after `shellcheck sources`: every tracked `.bats` file, same
+  invocation (`-x -e SC1091,SC2034 -S warning`), skipped with a notice
+  where a repository has none. shellcheck reads bats syntax natively and
+  reports SC2314, the bare `! cmd` that `set -e` ignores inside a test;
+  that class returned twice after the fleet-wide fix, which is why.
+  Workflow only: no tag, consumers call it at `main`. Every suite in the
+  fleet was made clean against that invocation first (2026-10-18).
+
 - **`provision-report` shows what a step ran and who chose it.** A record
   that carries a `command` or `selected_by` key (sys-bld writes both on
   every checklist step since its `--step`/`--arg` command line: the

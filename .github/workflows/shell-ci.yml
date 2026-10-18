@@ -80,6 +80,25 @@ jobs:
           printf '%s\n' "${files[@]}"
           shellcheck -x -e SC1091,SC2034 -S warning "${files[@]}"
 
+      # The test suites are linted with the same rule as the sources.
+      # shellcheck reads bats syntax natively (@test blocks, $status,
+      # $output, $lines) and reports SC2314, a bare `! cmd` that set -e
+      # ignores and so never fails its test: that class came back twice
+      # after it was fixed fleet-wide (FA-fleet-014), because nothing
+      # checked the suites. A repository without .bats files skips this
+      # step; the selector is by extension because bats files carry a
+      # `#!/usr/bin/env bats` shebang, which the source selector above
+      # does not match on purpose.
+      - name: shellcheck tests
+        run: |
+          mapfile -t files < <(git ls-files '*.bats')
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::notice::No .bats files — nothing to lint"
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          shellcheck -x -e SC1091,SC2034 -S warning "${files[@]}"
+
   build:
     if: inputs.build
     runs-on: ubuntu-latest

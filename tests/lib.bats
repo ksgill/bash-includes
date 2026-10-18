@@ -4531,10 +4531,14 @@ _real_root_cleanup() {
 
 @test "log_open_transcript (real root): will not hand over a file that is already there and not the caller's" {
     _real_root
+    # shellcheck disable=SC2033  # the real binary, not the stub function of that name above
     command sudo install -d -m 0755 -o root -g root "/var/lib/provision/log" "/var/lib/provision/log/${REAL_TOOL}"
+    # shellcheck disable=SC2033  # the real binary, not the stub function of that name above
     command sudo install -m 0600 -o root -g root /dev/null "/var/lib/provision/log/${REAL_TOOL}/run-1.log"
     run bash -c 'set -euo pipefail; . "$1/log.sh"; log_open_transcript "/var/lib/provision/log/$2/run-1.log" 2>&1; echo "file=[$_LOG_FILE]"' _ "$LIB" "$REAL_TOOL"
-    local owner; owner="$(command sudo stat -c '%U %a' "/var/lib/provision/log/${REAL_TOOL}/run-1.log")"
+    local owner
+    # shellcheck disable=SC2033  # the real binary, not the stub function of that name above
+    owner="$(command sudo stat -c '%U %a' "/var/lib/provision/log/${REAL_TOOL}/run-1.log")"
     _real_root_cleanup
     [[ "$output" == *"something else is already there"* ]]
     [[ "$output" == *"file=[]"* ]]
@@ -4809,7 +4813,9 @@ disable vpn@x.service" ]
 @test "snapshot (real root): root and snapshot are root 0700, and a root 0600 file keeps owner and mode" {
     _real_root
     local base="/var/tmp/${REAL_TOOL}"
+    # shellcheck disable=SC2033  # the real binary, not the stub function of that name above
     command sudo install -d -m 0700 -o root -g root "$base" "${base}/etc"
+    # shellcheck disable=SC2033  # the real binary, not the stub function of that name above
     command sudo install -m 0600 -o root -g root /dev/null "${base}/etc/server.key"
     run bash -c 'set -euo pipefail; . "$1/log.sh"; . "$1/journal.sh"; . "$1/teardown.sh"
         JOURNAL_DIR="$2/journal"; journal_init t v1 >/dev/null 2>&1
