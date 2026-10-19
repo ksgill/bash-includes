@@ -146,6 +146,157 @@ teardown() {
     fi
 }
 
+# ── _sshd_addr_key / sshd_session_covered ─────────────────────────────────────
+# The session-coverage cases the VPN builders carried (wireguard-bld's
+# tests/wireguard-bld.bats session-coverage block, each a mutation of
+# session_covered that the case catches), on the library function; plus the
+# wildcard server address openvpn-bld's address-level agreement check needs.
+
+@test "_sshd_addr_key: the scope removed, the mapped form unmapped, hex lower-cased; a plain address unchanged" {
+    [ "$(_sshd_addr_key 'fe80::1%eth0')" = 'fe80::1' ]
+    [ "$(_sshd_addr_key '::ffff:10.8.0.1')" = '10.8.0.1' ]
+    [ "$(_sshd_addr_key '::FFFF:10.8.0.1')" = '10.8.0.1' ]
+    [ "$(_sshd_addr_key '2001:DB8::ABCD')" = '2001:db8::abcd' ]
+    [ "$(_sshd_addr_key '2001:DB8::ABCD%ETH0')" = '2001:db8::abcd' ]
+    [ "$(_sshd_addr_key '10.8.0.1')" = '10.8.0.1' ]
+    [ "$(_sshd_addr_key '*')" = '*' ]
+    [ "$(_sshd_addr_key '*%eth0')" = '*' ]
+    # Two spellings of one IPv6 address are not made equal.
+    [ "$(_sshd_addr_key '2001:db8:0:0::1')" = '2001:db8:0:0::1' ]
+}
+
+# Mutation: the key-equality line removed → not covered.
+@test "sshd_session_covered: a listener bound to exactly the session's server address covers it; a port match alone does not" {
+    sshd_session_covered 10.8.0.1 22 '10.8.0.1 22'
+    sshd_session_covered 2001:db8::5 22 '2001:db8::5 22'
+    # Another address on that port: the only rule is for 10.8.0.1.
+    run ! sshd_session_covered 192.168.1.5 22 '10.8.0.1 22'
+    # The right address on another port.
+    run ! sshd_session_covered 10.8.0.1 22 '10.8.0.1 2222'
+    # Any covering endpoint in the list is enough; nothing is printed.
+    run sshd_session_covered 10.8.0.1 22 '10.8.0.2 22' '10.8.0.1 2222' '10.8.0.1 22'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    run sshd_session_covered 10.8.0.1 22
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+}
+
+# Mutation: the scope gate removed (a scoped listener read as unscoped) →
+# the other-scope and the unscoped sessions count as covered.
+@test "sshd_session_covered: a scoped listener covers a session whose server address carries the same scope, and no other" {
+    sshd_session_covered 'fe80::1%eth0' 22 'fe80::1%eth0 22'
+    run ! sshd_session_covered 'fe80::1%eth1' 22 'fe80::1%eth0 22'
+    # An unscoped session address says nothing about the link it came in
+    # on, so a device-bound listener never covers it.
+    run ! sshd_session_covered 192.168.1.5 22 '0.0.0.0%eth0 22'
+    run ! sshd_session_covered 'fe80::1' 22 'fe80::1%eth0 22'
+    # A scoped session is covered by the unscoped same address or wildcard.
+    sshd_session_covered 'fe80::1%eth0' 22 'fe80::1 22'
+    sshd_session_covered 'fe80::1%eth0' 22 ':: 22'
+}
+
+# Mutation: the "*" test done on the address before its scope is stripped →
+# "*%eth0" never covers.
+@test "sshd_session_covered: a device-bound dual-stack listener (*%eth0) covers a session with that scope" {
+    sshd_session_covered 'fe80::1%eth0' 22 '*%eth0 22'
+    sshd_session_covered '192.168.1.5%eth0' 22 '*%eth0 22'
+    run ! sshd_session_covered 'fe80::1%eth1' 22 '*%eth0 22'
+    run ! sshd_session_covered 192.168.1.5 22 '*%eth0 22'
+}
+
+# Mutation: _sshd_addr_key made the identity (no scope strip, no
+# lower-casing, no unmapping) → neither session is covered.
+@test "sshd_session_covered: an upper-case, scoped or ::ffff:-mapped session address matches the listener's" {
+    sshd_session_covered '2001:DB8::1%eth0' 22 '2001:db8::1 22'
+    sshd_session_covered '::ffff:10.8.0.1' 22 '10.8.0.1 22'
+    sshd_session_covered '10.8.0.1' 22 '::ffff:10.8.0.1 22'
+    sshd_session_covered '::FFFF:10.8.0.1' 22 '0.0.0.0 22'
+}
+
+# Mutation: the "*" return removed → not covered.
+@test "sshd_session_covered: a dual-stack any-address listener (*) covers every session on its port" {
+    sshd_session_covered 192.168.1.5 22 '* 22'
+    sshd_session_covered 2001:db8::5 22 '* 22'
+    sshd_session_covered 'fe80::1%eth0' 22 '* 22'
+    run ! sshd_session_covered 192.168.1.5 22 '* 2222'
+}
+
+# Mutation: the status-1 return removed → not covered.
+@test "sshd_session_covered: a listener the library does not understand (port-wide rule) covers the session" {
+    sshd_session_covered 192.168.1.5 22 'bastion.example 22'
+    sshd_session_covered 2001:db8::5 22 'bastion.example 22'
+    # A digit scope is one of those too (nft cannot take an index).
+    sshd_session_covered 192.168.1.5 22 '0.0.0.0%2 22'
+    run ! sshd_session_covered 192.168.1.5 22 'bastion.example 2222'
+}
+
+# Mutation: the session check by port alone → covered.
+@test "sshd_session_covered: a family wildcard covers only its own family — :: does not cover an IPv4 session, 0.0.0.0 not an IPv6 one" {
+    run ! sshd_session_covered 192.168.1.5 22 ':: 22'
+    sshd_session_covered 192.168.1.5 22 '0.0.0.0 22'
+    run ! sshd_session_covered 2001:db8::5 22 '0.0.0.0 22'
+    sshd_session_covered 2001:db8::5 22 ':: 22'
+    # An IPv4 session reached through a dual-stack socket is IPv4.
+    run ! sshd_session_covered '::ffff:192.168.1.5' 22 ':: 22'
+    sshd_session_covered '::ffff:192.168.1.5' 22 '0.0.0.0 22'
+}
+
+# Mutation: the IPv6 wildcard test narrowed to the literal "::" → not covered.
+@test "sshd_session_covered: the IPv6 any address spelled 0:0:0:0:0:0:0:0 or 0000:: covers an IPv6 session" {
+    sshd_session_covered 2001:db8::5 22 '0:0:0:0:0:0:0:0 22'
+    sshd_session_covered 2001:db8::5 22 '0000:: 22'
+    sshd_session_covered 2001:db8::5 22 '::0 22'
+    run ! sshd_session_covered 192.168.1.5 22 '0:0:0:0:0:0:0:0 22'
+}
+
+@test "sshd_session_covered: a wildcard server address (one endpoint set held against another) is covered by *, 0.0.0.0 or any spelling of ::, not by an address" {
+    sshd_session_covered '*' 22 '* 22'
+    sshd_session_covered '*' 22 '0.0.0.0 22'
+    sshd_session_covered '*' 22 ':: 22'
+    sshd_session_covered '*' 22 '0:0:0:0:0:0:0:0 22'
+    run ! sshd_session_covered '*' 22 '10.8.0.1 22'
+    run ! sshd_session_covered '*' 22 '2001:db8::1 22'
+    run ! sshd_session_covered '*' 22 '0.0.0.0 2222'
+    # A scoped wildcard listener still needs the scope on the server side.
+    run ! sshd_session_covered '*' 22 '0.0.0.0%eth0 22'
+    sshd_session_covered '*%eth0' 22 '0.0.0.0%eth0 22'
+    # The family wildcards hold against each other only through "*".
+    sshd_session_covered '0.0.0.0' 22 '0.0.0.0 22'
+    sshd_session_covered '0.0.0.0' 22 '* 22'
+    run ! sshd_session_covered '0.0.0.0' 22 ':: 22'
+    run ! sshd_session_covered '::' 22 '0.0.0.0 22'
+}
+
+@test "sshd_session_covered: an empty server address or a port that is not a number is not covered, whatever the endpoints" {
+    # An empty port would match an endpoint with no port field; an empty
+    # address reads as IPv4. Both are the lockout direction, so 1.
+    run ! sshd_session_covered '' '' '*'
+    run ! sshd_session_covered '' '' 'bastion'
+    run ! sshd_session_covered '' 22 '0.0.0.0 22'
+    run ! sshd_session_covered '' 22 '* 22'
+    run ! sshd_session_covered 10.8.0.1 '' '* '
+    run ! sshd_session_covered 10.8.0.1 '' '*'
+    run ! sshd_session_covered 10.8.0.1 2x '* 2x'
+    run ! sshd_session_covered 10.8.0.1 ' 22' '* 22'
+    sshd_session_covered 10.8.0.1 22 '* 22'
+}
+
+@test "sshd_session_covered: asks sshd_endpoint_match for the inet family whatever the caller's FILTER_FAMILY says" {
+    # With the family read from a variable, an empty or wrong one made every
+    # endpoint "not an address" and every session covered (the lockout
+    # direction); fixed at inet, nothing in the environment changes the answer.
+    export FILTER_FAMILY=""
+    run ! sshd_session_covered 192.168.1.5 22 '10.8.0.1 22'
+    export FILTER_FAMILY="bogus"
+    run ! sshd_session_covered 192.168.1.5 22 '10.8.0.1 22'
+    sshd_session_covered 10.8.0.1 22 '10.8.0.1 22'
+    # shellcheck disable=SC2317
+    sshd_endpoint_match() { echo "fam=$1" >> "${TMP}/fam"; return 0; }
+    sshd_session_covered 10.8.0.1 22 '10.8.0.2 22' '10.8.0.1 22'
+    [ "$(sort -u "${TMP}/fam")" = "fam=inet" ]
+}
+
 # ── sshd_master_pid ───────────────────────────────────────────────────────────
 
 @test "sshd_master_pid prints MainPID, nothing for 0, 1, empty or garbage" {

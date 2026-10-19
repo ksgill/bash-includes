@@ -366,6 +366,19 @@ log_error()   { _log "$_LOG_RED" "ERROR"   2 "$@"; }
 
 die() { log_error "$*"; exit 1; }
 
+# ── log_printable <text> ──────────────────────────────────────────────────────
+# <text> with every byte outside the printable ASCII range replaced by '?',
+# under the C locale (so C1 controls and stray multibyte sequences count as
+# non-printable too): for naming something read from a tool's output or the
+# environment (an address from sshd -T, ss or SSH_CONNECTION) in a message or
+# a generated comment, where a control character would reshape the line.
+# Lifted from the two VPN builders, which each carried it as `printable`
+# (FA-fleet-024).
+log_printable() {
+    local LC_ALL=C
+    printf '%s\n' "${1//[^[:print:]]/?}"
+}
+
 # ── section <title> ───────────────────────────────────────────────────────────
 # Visual separator for long provisioning runs.
 section() {

@@ -423,6 +423,72 @@ strict() {
     no_leftovers
 }
 
+# ── install_atomic_glob ──────────────────────────────────────────────────────
+
+@test "install_atomic_glob: the name install_atomic stages under, made from the same template; 1 for a path that is not absolute" {
+    local glob
+    glob="$(install_atomic_glob "${W}/fw-up-test.sh")"
+    [ "$glob" = '.fw-up-test.sh.[[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]]~' ]
+    # A name made with the template install_atomic hands to mktemp matches
+    # the glob, the way a leftover is looked for (find -name).
+    local staged
+    staged="$(mktemp --suffix="$_FILE_STAGE_SUFFIX" -- "${W}/$(_file_stage_name fw-up-test.sh template)")"
+    [ "$(find "$W" -maxdepth 1 -name "$glob" -print)" = "$staged" ]
+    # The glob is exact in length: a name one character shorter or longer
+    # is not a staging file, and neither is one without the ~.
+    : > "${W}/.fw-up-test.sh.abcdefg~" "${W}/.fw-up-test.sh.abcdefghi~" "${W}/.fw-up-test.sh.abcdefgh"
+    [ "$(find "$W" -maxdepth 1 -name "$glob" -print)" = "$staged" ]
+    rm -f -- "$staged" "${W}"/.fw-up-test.sh.*
+    run install_atomic_glob relative/path
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+    run install_atomic_glob "${W}/"
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+    run install_atomic_glob
+    [ "$status" -eq 1 ]
+    # A name that would widen the pattern (glob metacharacters, a control
+    # character) is refused rather than escaped: no installed file of the
+    # fleet is named that way, and a widened glob removes the wrong files.
+    local bad
+    for bad in 'a*b' 'a?b' 'a[1].sh' 'a\\b' $'a\nb' $'a\tb'; do
+        run install_atomic_glob "${W}/${bad}"
+        [ "$status" -eq 1 ]
+        [ -z "$output" ]
+    done
+    # An ordinary name with a dot, a dash and a plus is fine.
+    install_atomic_glob "${W}/fw-up.v1+2.sh" > /dev/null
+}
+
+@test "install_atomic_glob: the staged name install_atomic really creates matches it, and a refused rename leaves nothing for the glob to find" {
+    printf 'new\n' > "${W}/src"
+    printf 'old\n' > "${W}/dest"
+    local glob
+    glob="$(install_atomic_glob "${W}/dest")"
+    # The mv after the stage is refused; the stub records the staged name.
+    # shellcheck disable=SC2317
+    sudo() {
+        case "${1:-}" in -v|-n) shift ;; esac
+        [[ $# -eq 0 ]] && return 0
+        if [[ "$1" == mv ]]; then
+            printf '%s\n' "$5" > "${TMP}/staged"
+            return 1
+        fi
+        "$@"
+    }
+    run install_atomic "${W}/src" 0640 "${W}/dest"
+    [ "$status" -eq 1 ]
+    local staged
+    staged="$(cat "${TMP}/staged")"
+    [ "${staged%/*}" = "$W" ]
+    # shellcheck disable=SC2053
+    [[ "${staged##*/}" == $glob ]]
+    [ "$(cat "${W}/dest")" = "old" ]
+    # install_atomic removed its staging file: the glob finds nothing.
+    [ -z "$(find "$W" -maxdepth 1 -name "$glob" -print)" ]
+    no_leftovers
+}
+
 # ── mkdir_root_p ─────────────────────────────────────────────────────────────
 
 @test "mkdir_root_p: every missing level is 0755 whatever the umask; existing levels are not touched; an existing file or open ancestor is refused" {

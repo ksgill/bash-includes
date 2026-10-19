@@ -80,6 +80,9 @@
 #                                      so a broken check costs a rewrite and a
 #                                      .bak per run, never a skipped write
 #   install_atomic <src> <mode> <dest> stage beside <dest>, rename over it
+#   install_atomic_glob <dest>         the glob that finds a staging file
+#                                      install_atomic left beside <dest> when
+#                                      it was killed between the two steps
 #   mkdir_root_p <dir>                 <dir> and missing parents, 0755, root's
 #
 # "root" throughout means the account sudo runs commands as, read once with
@@ -280,6 +283,51 @@ mkdir_root_p() {
     return 0
 }
 
+# The staging file's name beside its target, in one place for the mktemp
+# template install_atomic uses and the glob install_atomic_glob prints, so
+# the two cannot drift: a dot, the target's name, a dot, _FILE_STAGE_RANDOM
+# characters mktemp draws from [[:alnum:]], and _FILE_STAGE_SUFFIX.
+# _file_stage_name <base> <template|glob> prints the name without the
+# suffix: with "template" the random characters are X's (what mktemp takes,
+# the suffix passed with --suffix); with "glob" each is a [[:alnum:]]
+# bracket, one per character, so a target whose own name holds the letters
+# of a template never matches.
+_FILE_STAGE_RANDOM=8
+_FILE_STAGE_SUFFIX='~'
+_file_stage_name() {
+    local base="$1" kind="$2" rnd="" i
+    for (( i = 0; i < _FILE_STAGE_RANDOM; i++ )); do
+        if [[ "$kind" == glob ]]; then
+            rnd+='[[:alnum:]]'
+        else
+            rnd+='X'
+        fi
+    done
+    printf '.%s.%s\n' "$base" "$rnd"
+}
+
+# ── install_atomic_glob <dest> ────────────────────────────────────────────────
+# The glob that matches a staging file install_atomic left beside <dest>
+# when it was killed between its mktemp and its rename (`.<name>.` then
+# eight alphanumerics and `~`): for a caller that looks for leftovers in the
+# directory it installs into and treats them as it treats the file itself
+# (wireguard-bld's existing-install detection). The name only, no
+# directory, for `find -name` or a `[[ == ]]` pattern, matched under
+# LC_ALL=C (in a UTF-8 locale `[[:alnum:]]` takes letters mktemp never
+# writes). 1 and nothing printed for a <dest> that is not an absolute path
+# to a file, or whose name holds a glob metacharacter (`*`, `?`, `[`, `\`)
+# or a control character: the name goes into the pattern as it is, and such
+# a name would widen it to files that are not staging files.
+install_atomic_glob() {
+    local LC_ALL=C dest="${1:-}" base
+    [[ "$dest" == /* && "$dest" != */ ]] || return 1
+    base="${dest##*/}"
+    case "$base" in
+        *[\\*?\[]*|*[[:cntrl:]]*) return 1 ;;
+    esac
+    printf '%s%s\n' "$(_file_stage_name "$base" glob)" "$_FILE_STAGE_SUFFIX"
+}
+
 # ── install_atomic <src> <mode> <dest> ───────────────────────────────────────
 # Install <src> as <dest>, <mode>, root's, without a moment in which <dest> is
 # missing or half-written. `install` alone unlinks and recreates the target,
@@ -288,13 +336,14 @@ mkdir_root_p() {
 #
 # <dest>'s directory must pass the directory rule and must exist. The content
 # is installed into a file root creates with mktemp beside the target
-# (`.<name>.XXXXXXXX~`: hidden and ending in `~`, which the loaders that read
-# whole directories skip, and random, so nothing can be planted there first)
-# and renamed over the target; rename(2) replaces it in one step. -T keeps a
-# directory at <dest> an error instead of a place to move the file into. The
-# staging file is removed on failure, and at exit if the run is interrupted
-# with cleanup.sh loaded. Returns 1 without a message; the caller knows what
-# the file was for.
+# (`.<name>.XXXXXXXX~`, _file_stage_name: hidden and ending in `~`, which the
+# loaders that read whole directories skip, and random, so nothing can be
+# planted there first) and renamed over the target; rename(2) replaces it in
+# one step. -T keeps a directory at <dest> an error instead of a place to
+# move the file into. The staging file is removed on failure, and at exit if
+# the run is interrupted with cleanup.sh loaded; one left by a kill between
+# the two steps is found with install_atomic_glob. Returns 1 without a
+# message; the caller knows what the file was for.
 install_atomic() {
     local src="$1" mode="$2" dest="$3" canon base staged
 
@@ -305,7 +354,7 @@ install_atomic() {
     # The parent itself must exist (the walk appends what does not).
     _backup_exists -d "$canon" || return 1
     base="${dest##*/}"
-    staged="$(sudo mktemp --suffix='~' -- "${canon}/.${base}.XXXXXXXX")" || return 1
+    staged="$(sudo mktemp --suffix="$_FILE_STAGE_SUFFIX" -- "${canon}/$(_file_stage_name "$base" template)")" || return 1
     _file_tmp_register root "$staged"
     if ! sudo install -m "$mode" -o "$_FILE_UID" -g "$_FILE_GID" -T -- "$src" "$staged"; then
         sudo rm -f -- "$staged"; _file_tmp_forget_root "$staged"

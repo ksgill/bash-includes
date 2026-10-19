@@ -33,6 +33,12 @@
 #    the `ip daddr <a>` / `ip6 daddr <a>` match the rule carries when the
 #    address is not a wildcard (0.0.0.0, ::, or *).
 #
+# And one question a caller that writes such rules has to ask before it
+# applies a drop policy: does the SSH session it is running in keep an
+# accept rule? sshd_session_covered answers it for a server address and
+# port against the endpoints the readers print (the rule the two VPN
+# builders each carried as session_covered, FA-fleet-024).
+#
 # Lifted from openvpn-bld, wireguard-bld and sys-bld, which carried three
 # readers of the same output (FA-fleet-020).
 #
@@ -220,6 +226,96 @@ sshd_endpoint_match() {
     fi
     printf '%sip6 daddr %s \n' "${prefix}" "${addr}"
     return 0
+}
+
+# ── _sshd_addr_key <address> ──────────────────────────────────────────────────
+# The form two addresses are compared in: a "%scope" removed, an IPv4-mapped
+# IPv6 address (::ffff:a.b.c.d) unmapped, hexadecimal digits in lower case.
+# SSH_CONNECTION's server address and the readers' listener addresses can
+# each carry a scope or the mapped form (sshd prints a dual-stack socket's
+# IPv4 peer mapped). Two spellings of one IPv6 address (2001:db8::1 and
+# 2001:db8:0:0::1) still compare unequal. Private: sshd_session_covered is
+# its caller.
+_sshd_addr_key() {
+    local LC_ALL=C a="${1%%%*}"
+    a="${a,,}"
+    if [[ "${a}" =~ ^::ffff:([0-9.]+)$ ]]; then
+        a="${BASH_REMATCH[1]}"
+    fi
+    printf '%s\n' "${a}"
+}
+
+# ── sshd_session_covered <server address> <port> <endpoint>... ────────────────
+# Whether the SSH session that reached <server address>:<port> keeps an
+# accept rule once per-listener rules are written for <endpoint>... (each
+# "<address> <port>" as the *_endpoints_* readers print it): 0 when some
+# endpoint has that port and an address that covers the server address, 1
+# otherwise; nothing is printed. An address covers the session when it is
+# the same address (_sshd_addr_key on both), the family wildcard of the
+# session's family (0.0.0.0 for IPv4; :: in any spelling for IPv6 — an IPv4
+# session is NOT covered by "::", which sshd_endpoint_match treats as
+# IPv6-only), "*" (both families), or an address sshd_endpoint_match does
+# not understand (a name: its rule is written port-wide). A scoped or
+# device-bound listener (fe80::1%eth0, 0.0.0.0%eth0, *%eth0 — its rule
+# carries iifname) covers only a session whose own server address carries
+# the same %scope, and an unscoped session address never: which interface a
+# session came in on is not knowable from its address (the interface
+# holding an address is not its ingress), so it is not guessed. A port
+# match alone is not enough: with `ListenAddress 10.8.0.1:22` and a session
+# on 192.168.1.5:22 (a second server on that port, not sshd's), the only
+# rule is `ip daddr 10.8.0.1 tcp dport 22` and the drop would end the
+# session. The same test holds one endpoint set against another (a caller's
+# address-level agreement check): there <server address> may itself be a
+# wildcard, and "*" is covered by "*" or by either family's wildcard (sshd
+# binds what the host has; with IPv6 off, "*" shows as 0.0.0.0 alone).
+#
+# The order: port, then status 1 from sshd_endpoint_match, then the scope
+# gate, then "*", the same address, the family wildcard. The family asked of
+# sshd_endpoint_match is fixed at inet: only status 1 (not an address) is
+# used, and for any valid family that answer is the same; with an empty or
+# wrong family every endpoint would read as port-wide and every session as
+# covered, which is the lockout direction. An empty server address or a
+# port that is not a number is answered 1 (not covered) for the same reason.
+sshd_session_covered() {
+    local saddr="$1" sport="$2" skey sscope="" v6=false endpoint addr port key rc
+    shift 2
+    # No answer for no question: an empty address or a port that is not a
+    # number would otherwise match an endpoint with no port field, or read
+    # as IPv4, and 0 here is the lockout direction.
+    [[ -n "${saddr}" && "${sport}" =~ ^[0-9]+$ ]] || return 1
+    skey="$(_sshd_addr_key "${saddr}")"
+    [[ "${saddr}" != *%* ]] || sscope="${saddr#*%}"
+    [[ "${skey}" != *:* ]] || v6=true
+    for endpoint in "$@"; do
+        read -r addr port <<< "${endpoint}"
+        [[ "${port}" == "${sport}" ]] || continue
+        # Not an address (a name, a digit scope): its rule is port-wide,
+        # which covers whatever address the session came in on.
+        rc=0
+        sshd_endpoint_match inet "${addr}" > /dev/null || rc=$?
+        (( rc != 1 )) || return 0
+        key="$(_sshd_addr_key "${addr}")"
+        if [[ "${addr}" == *%* ]]; then
+            [[ -n "${sscope}" && "${sscope}" == "${addr#*%}" ]] || continue
+        fi
+        # After the scope: "*%eth0" covers a session on eth0.
+        [[ "${key}" != '*' ]] || return 0
+        if [[ "${skey}" == '*' ]]; then
+            if [[ "${key}" == 0.0.0.0 ]] || [[ "${key}" == *:* && "${key}" =~ ^[0:]+$ ]]; then
+                return 0
+            fi
+            continue
+        fi
+        [[ "${key}" != "${skey}" ]] || return 0
+        if [[ "${v6}" == true ]]; then
+            [[ "${key}" != *:* || ! "${key}" =~ ^[0:]+$ ]] || return 0
+        else
+            [[ "${key}" != 0.0.0.0 ]] || return 0
+        fi
+        # Left: a scoped rule that is not this address, or an address of
+        # the other family (no rule for this session either way).
+    done
+    return 1
 }
 
 # ── sshd_master_pid ───────────────────────────────────────────────────────────

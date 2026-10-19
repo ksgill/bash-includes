@@ -15,13 +15,14 @@ their own repositories.
 ## Layout
 
 ```
-lib/log.sh            timestamped, per-stream colour-aware logging
+lib/log.sh            timestamped, per-stream colour-aware logging; text made printable for a message
 lib/privilege.sh      enforce run-as-user / escalate-per-command
 lib/cleanup.sh        stack of teardown handlers sharing one EXIT trap
 lib/child.sh          run a privileged command as a tracked background child
 lib/journal.sh        append-only record of persistent system changes
 lib/backup.sh         the .orig / .bak backup convention
-lib/file.sh           write a root-owned file only when its content, mode or owner changes
+lib/file.sh           write a root-owned file only when its content, mode or owner changes; the staging name a killed install leaves
+lib/payload.sh        a built payload checked before use (whole, current, parses, no bootstrap) and rendered under a NAME=%q settings header
 lib/teardown.sh       snapshot what a rebuild removes, stop units, remove it
 lib/os.sh             OS, arch, kernel, init and session detection
 lib/apt.sh            APT repository and package helpers
@@ -31,7 +32,8 @@ lib/oui.sh            MAC vendor lookup
 lib/mac.sh            read an interface's MAC address; set it and read it back, in this or another network namespace
 lib/netdev.sh         an interface's existence, IFF_UP state and wireless phy; the modes a phy supports
 lib/nft.sh            jq programs over nft's JSON listings: chain policy, other forward users, filter family, jump handles
-lib/sshd.sh           the SSH ports and endpoints sshd is configured for (sshd -T), ssh.socket listens on, and sshd actually holds (ss); an endpoint's nft address match
+lib/nftchain.sh       a root-run hook's own chains: fresh at start, jumps by handle and deleted at stop, the forward policy; status tokens, no logging
+lib/sshd.sh           the SSH ports and endpoints sshd is configured for (sshd -T), ssh.socket listens on, and sshd actually holds (ss); an endpoint's nft address match; whether the session keeps a rule
 lib/git.sh            git identity, GitHub ssh stanza, pinned host key
 bin/provision-report  read and verify the change journal
 bin/bld               resolve # include: directives into a self-contained script
@@ -447,6 +449,107 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.16.0
+
+The helpers the two VPN builders each carried for their embedded payloads
+and their root-run firewall hooks, lifted into the library (FA-fleet-023,
+FA-fleet-024). Each existed twice, and a fix made in one builder stayed
+there: wireguard-bld refuses an empty, cut or unbuilt payload and strips
+control characters from the hook header, openvpn-bld does neither;
+openvpn-bld covers a wildcard server address in the session check and
+checks nothing about a rule handle before pasting it into `nft delete
+rule`. One copy, one test suite, one fix, and the gaps close on each
+builder's next re-pin. Nothing existing changes for a consumer that uses
+none of it.
+
+- **`payload.sh`** (new, includes log.sh), for a script that embeds a
+  bld-built payload. `payload_check [--last <line>] <artefact> <source>
+  [<dependency>...]` refuses, with `log_error` and status 1, an artefact
+  that is missing, empty, does not parse, still holds the development
+  bootstrap (bld's marker as an exact line, or a `_bootstrap_lib()`
+  definition — not the bare name, which a payload that includes payload.sh
+  carries itself), or, with `--last`, whose last non-blank line is not that
+  line (`main` for a hook: bld leaves a `build/<x>.sh` that failed its own
+  `bash -n` in place, and one cut at a line boundary parses and, installed
+  as a hook, exits 0 having done nothing); and, in a development checkout
+  only (where `_bootstrap_lib` is defined), one older than its source, any
+  dependency given, or any `*.sh` in the directory payload.sh was sourced
+  from (`_PAYLOAD_LIBDIR`), which is the library checkout that moved under
+  an unchanged LIB_VERSION neither builder could see. It returns, never
+  exits: `payload_check … || exit 1`. `payload_render [--shebang <line>]
+  [--readonly] [--comment <text>]... [--] <payload> [NAME | NAME=value]...`
+  prints the payload as installed: line 1 (the given shebang, or the
+  payload's own, which must be one), each comment with control characters
+  removed (a newline in a checkout's SCRIPT_VERSION would end the comment
+  and start a line root runs), each setting as `[readonly ]NAME=%q` under
+  the C locale (a bare NAME must be set and may be empty; NAME=value is the
+  literal; NAME must be an identifier not starting with `_payload_`, the
+  prefix of the function's own locals), then the payload from line 2.
+  Everything is checked before anything is printed; every step is
+  `|| return 1`. Which settings and what the comments say stay with the
+  caller; the result goes through `install_atomic`.
+
+- **`nftchain.sh`** (new, includes nft.sh and nothing else), for the hooks
+  themselves: it runs no command at source time, so a hook that pins PATH
+  as its first command keeps that property with it inlined, and it logs
+  nothing — every function prints a status token and returns, and what a
+  token is worth (a WARN, a fatal start, a line in a list) stays in the
+  hook. `nft_chain_fresh <family> <table> <chain>` adds and then flushes
+  the chain whatever its state (`nft add chain` on an existing chain
+  succeeds and would have appended the new rules to the old; a probe that
+  fails cannot change that), printing `created` or `flushed` (a chain left
+  by a stop that could not delete it), 1 when nft refused. `nft_jump_handles <family> <table> <base> <target>` prints the
+  numeric handles of the rules that jump or goto to the target from the
+  JSON listing, 1 when the listing or jq failed, 2 after the numeric ones
+  when a handle was not a number (judged in jq, so a string holding a
+  newline cannot pass as two numbers) — openvpn-bld pasted jq's output
+  into `nft delete rule … handle` unchecked; read it as `handles="$(…)";
+  rc=$?`, since status 2 comes with the good handles. `nft_delete_chain
+  <family> <table> <chain>` prints `deleted`, or `absent` when the delete
+  was refused and the chain is not there, 1 when it still is.
+  `nft_forward_drop <family> <table>` is the forward-policy decision both
+  hooks carried (`_NFT_FWD_OTHERS_JQ`, `_NFT_POLICY_JQ`): one token among
+  `unread`, `created-drop`, `created-accept <others>`, `drop-failed
+  missing`, `flipped`, `drop-failed accept`, `kept <others>`, `drop` and
+  `not-base` (a chain named forward that is not a base chain on the forward
+  hook; whether that fails the start is the hook's call), and 1 only when a
+  policy-accept create failed. Tested against a stateful nft fake
+  (`tests/fake-nft.sh`, a copy of openvpn-bld's).
+
+- **`sshd.sh`: `sshd_session_covered <server address> <port>
+  <endpoint>...`** — whether the SSH session that reached that address and
+  port keeps an accept rule once per-listener rules are written for the
+  endpoints (as the `*_endpoints_*` readers print them): 0 or 1, silent;
+  1 as well for an empty server address or a port that is not a number.
+  The same address (`_sshd_addr_key`: scope off, mapped form unmapped,
+  lower case), the family wildcard of the session's family (`::` never
+  covers an IPv4 session), `*`, a scoped listener only for a session with
+  the same scope, a name (port-wide rule) always; and a wildcard server
+  address, for a caller holding one endpoint set against another, is
+  covered by `*` or either family's wildcard. The family asked of
+  `sshd_endpoint_match` is fixed at `inet`: only "not an address" is used,
+  which no valid family changes, and an empty or wrong family read from a
+  variable made every session covered, the lockout direction. The builders'
+  `session_covered` and `ssh_addr_key` go.
+
+- **`file.sh`: `install_atomic_glob <dest>`** prints the glob
+  (`.<name>.` then eight `[[:alnum:]]` and `~`) that finds a staging file
+  `install_atomic` left beside `<dest>` when it was killed between its
+  mktemp and its rename, for a caller that lists leftovers in the directory
+  it installs into (matched under `LC_ALL=C`; 1 for a name holding a glob
+  metacharacter or a control character, which would widen the pattern). The glob and `install_atomic`'s mktemp template come
+  from one helper (`_file_stage_name`), so they cannot drift. The builders'
+  `install_fw_hook` becomes `payload_render … > "$tmp"` plus
+  `install_atomic "$tmp" 0700 "$path"`, which also gives the hooks the
+  directory-trust walk.
+
+- **`log.sh`: `log_printable <text>`** — every byte outside printable ASCII
+  replaced by `?` under the C locale, for naming an address or a value from
+  the environment in a message or a generated comment. The builders'
+  identical `printable` goes; the name differs because a payload that
+  includes log.sh (openvpn-bld's `ovpnbld-ca.sh`) defines its own
+  `printable`, and bld's duplicate check would fail the build.
 
 ## Changes in v1.15.0
 
