@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# The reusable workflow runs third-party actions; the token they get is
+# read-only whatever the repository's default setting says.
+permissions:
+  contents: read
+
 jobs:
   shell:
     uses: ./.github/workflows/shell-ci.yml
