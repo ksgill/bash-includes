@@ -464,6 +464,32 @@ strict() {
 
 # ── install_atomic_glob ──────────────────────────────────────────────────────
 
+@test "file_dir_trusted: a closed chain passes, a group-writable ancestor (Debian's /usr/local root:staff 2775) is refused by name and mode, nothing is created" {
+    mkdir -m 0755 "${W}/usr"
+    mkdir -m 0755 "${W}/usr/local"
+    file_dir_trusted "${W}/usr/local/libexec/tool"
+    [ ! -e "${W}/usr/local/libexec" ]
+    chmod 2775 "${W}/usr/local"
+    run --separate-stderr file_dir_trusted "${W}/usr/local/libexec/tool"
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"root must not write under ${W}/usr/local/libexec/tool: ${W}/usr/local is writable by group or other (mode 2775)"* ]]
+    [[ "$stderr" == *"chmod g-w,o-w"* ]]
+    [ ! -e "${W}/usr/local/libexec" ]
+    chmod 0755 "${W}/usr/local"
+    file_dir_trusted "${W}/usr/local/libexec/tool"
+    # The directory itself, when it exists, is judged too.
+    mkdir -m 0775 "${W}/usr/local/libexec"
+    run ! file_dir_trusted "${W}/usr/local/libexec"
+    chmod 0755 "${W}/usr/local/libexec"
+    file_dir_trusted "${W}/usr/local/libexec"
+    file_dir_trusted "${W}/usr/local/libexec/"
+    run --separate-stderr file_dir_trusted relative/dir
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"not an absolute path"* ]]
+    run --separate-stderr file_dir_trusted
+    [ "$status" -eq 1 ]
+}
+
 @test "install_atomic_glob: the name install_atomic stages under, made from the same template; 1 for a path that is not absolute" {
     local glob
     glob="$(install_atomic_glob "${W}/fw-up-test.sh")"

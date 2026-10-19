@@ -306,6 +306,29 @@ _file_stage_name() {
     printf '.%s.%s\n' "$base" "$rnd"
 }
 
+# ── file_dir_trusted <dir> ────────────────────────────────────────────────────
+# Whether root may safely create or replace files in <dir>: every directory
+# along the path that exists passes the directory rule (root's or the
+# invoking user's; not writable by group or other unless sticky and
+# world-writable with the kernel's protected_* sysctls on; a link only
+# where root or the user placed it), and what does not exist yet would be
+# created under the checked part. The check the writers apply when they
+# write (install_file_if_changed, install_atomic, mkdir_root_p), offered on
+# its own for a preflight that names the problem before anything on the
+# host changes: Debian ships /usr/local as root:staff 2775, so a tool that
+# installs a root-run file under it is refused there until the mode is
+# fixed, and a build that learns this at its last step has already changed
+# the host. 0 when trusted; 1 after a log_error naming the directory and
+# the reason. Nothing is created or changed.
+file_dir_trusted() {
+    local dir="${1:-}" reason
+    [[ "$dir" == /* ]] || { log_error "file_dir_trusted: not an absolute path: '${dir}'"; return 1; }
+    if ! reason="$(_file_dir_trusted "${dir%/}/.")"; then
+        log_error "file_dir_trusted: root must not write under ${dir}: ${reason} (close the directory, chmod g-w,o-w, or use another path)"
+        return 1
+    fi
+}
+
 # ── install_atomic_glob <dest> ────────────────────────────────────────────────
 # The glob that matches a staging file install_atomic left beside <dest>
 # when it was killed between its mktemp and its rename (`.<name>.` then

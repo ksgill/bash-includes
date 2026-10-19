@@ -450,6 +450,18 @@ created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
 
+## Changes in v1.16.2
+
+- **`file.sh`: `file_dir_trusted <dir>`** — the directory rule the writers
+  apply (`install_file_if_changed`, `install_atomic`, `mkdir_root_p`),
+  offered on its own for a preflight: 0 when root may safely create or
+  replace files in `<dir>`, 1 after a `log_error` naming the directory and
+  the reason, nothing created. Debian ships `/usr/local` as `root:staff
+  2775`, which the rule refuses (a `staff` member could replace a root-run
+  file there); a builder that installs under it learns that from this call
+  before it changes the host, not from `install_atomic` at its last step
+  (found by the code review of wireguard-bld's v1.16.0 migration).
+
 ## Changes in v1.16.1
 
 - **`install_atomic` checks the directory its source waits in.** The
