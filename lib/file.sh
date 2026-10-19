@@ -323,6 +323,10 @@ _file_stage_name() {
 file_dir_trusted() {
     local dir="${1:-}" reason
     [[ "$dir" == /* ]] || { log_error "file_dir_trusted: not an absolute path: '${dir}'"; return 1; }
+    # The walk judges a link by its owner against root's uid, which
+    # _file_owner learns; without it a root-owned link on the chain would
+    # read as untrusted when this is the first file.sh call of a run.
+    _file_owner || return 1
     if ! reason="$(_file_dir_trusted "${dir%/}/.")"; then
         log_error "file_dir_trusted: root must not write under ${dir}: ${reason} (close the directory, chmod g-w,o-w, or use another path)"
         return 1

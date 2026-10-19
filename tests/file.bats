@@ -488,6 +488,12 @@ strict() {
     [[ "$stderr" == *"not an absolute path"* ]]
     run --separate-stderr file_dir_trusted
     [ "$status" -eq 1 ]
+    # The first file.sh call of a run: root's uid is learned before the walk,
+    # so a root-owned link on the chain is judged by it, not by an empty
+    # string (v1.16.3).
+    _FILE_UID="" _FILE_GID=""
+    file_dir_trusted "${W}/usr/local/libexec"
+    [[ "$_FILE_UID" =~ ^[0-9]+$ ]]
 }
 
 @test "install_atomic_glob: the name install_atomic stages under, made from the same template; 1 for a path that is not absolute" {

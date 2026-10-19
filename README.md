@@ -450,6 +450,14 @@ created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
 
+## Changes in v1.16.3
+
+- **`file_dir_trusted` learns root's uid before the walk.** The walk judges
+  a link on the chain by its owner against root's uid, which `_file_owner`
+  provides; as the first `file.sh` call of a run (a preflight is), v1.16.2's
+  function skipped that and a root-owned link read as untrusted. One line;
+  found by wireguard-bld's implementer.
+
 ## Changes in v1.16.2
 
 - **`file.sh`: `file_dir_trusted <dir>`** — the directory rule the writers
