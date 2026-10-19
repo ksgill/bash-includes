@@ -345,11 +345,26 @@ install_atomic_glob() {
 # the two steps is found with install_atomic_glob. Returns 1 without a
 # message; the caller knows what the file was for.
 install_atomic() {
-    local src="$1" mode="$2" dest="$3" canon base staged
+    local src="$1" mode="$2" dest="$3" canon base staged src_canon reason
 
     _file_owner || return 1
     [[ "$dest" == /* && "$dest" != */ ]] || return 1
     _file_mode "$mode" >/dev/null || return 1
+    # The source waits in the caller's file until root reads it, so the
+    # directory it waits in gets the same rule as the one root writes to:
+    # another account that can rename a file into that directory between
+    # the caller's write and root's `install` would have root install its
+    # content (the hooks the VPN builders render into TMPDIR run as root).
+    # A sticky world-writable directory with the protected_* sysctls on
+    # passes the rule, so the default /tmp is fine; a shared non-sticky
+    # TMPDIR is not.
+    src_canon="$(realpath -e -- "$src" 2>/dev/null)" \
+        || src_canon="$(sudo realpath -e -- "$src" 2>/dev/null)" \
+        || { log_error "install_atomic: ${src} cannot be resolved — ${dest} is unchanged"; return 1; }
+    if ! reason="$(_file_dir_trusted "$src_canon")"; then
+        log_error "install_atomic: refusing to read ${src} from its directory: ${reason} — set TMPDIR to a private directory; ${dest} is unchanged"
+        return 1
+    fi
     canon="$(_file_dir_trusted "$dest")" || return 1
     # The parent itself must exist (the walk appends what does not).
     _backup_exists -d "$canon" || return 1

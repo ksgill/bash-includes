@@ -450,6 +450,20 @@ created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
 
+## Changes in v1.16.1
+
+- **`install_atomic` checks the directory its source waits in.** The
+  source is the caller's file until root's `install` reads it, so its
+  directory now gets the same rule as the one root writes to (`realpath`
+  first, then the directory-trust walk): another account able to rename a
+  file into a shared, non-sticky TMPDIR between the caller's write and
+  root's read would otherwise have root install its content — and the VPN
+  builders' firewall hooks, rendered into TMPDIR by `payload_render` and
+  installed by `install_atomic`, run as root. The default `/tmp` (sticky,
+  world-writable, protected_* sysctls on) passes; a refusal says "set
+  TMPDIR to a private directory", as `install_file_if_changed` has since
+  v1.9.0. Found by the security review of wireguard-bld's v1.16.0 migration.
+
 ## Changes in v1.16.0
 
 The helpers the two VPN builders each carried for their embedded payloads

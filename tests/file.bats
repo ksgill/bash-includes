@@ -401,6 +401,45 @@ strict() {
     no_leftovers
 }
 
+@test "install_atomic: a source in a directory another account could write (group- or other-writable, not sticky) is refused; a private or a sticky world-writable one is read" {
+    printf 'old\n' > "${W}/dest"
+    # Another user's rename into this directory, between the caller's write
+    # and root's install, would be what root installs.
+    mkdir -m 0775 "${W}/shared"
+    printf 'new\n' > "${W}/shared/src"
+    run --separate-stderr install_atomic "${W}/shared/src" 0640 "${W}/dest"
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"refusing to read ${W}/shared/src from its directory"* ]]
+    [[ "$stderr" == *"set TMPDIR to a private directory"* ]]
+    [ "$(cat "${W}/dest")" = "old" ]
+    no_leftovers
+    chmod 0777 "${W}/shared"
+    run ! install_atomic "${W}/shared/src" 0640 "${W}/dest"
+    [ "$(cat "${W}/dest")" = "old" ]
+    # A private directory, and the default /tmp's shape (sticky, world-
+    # writable, with the kernel's protected_* sysctls on) are both read.
+    mkdir -m 0700 "${W}/private"
+    printf 'new\n' > "${W}/private/src"
+    install_atomic "${W}/private/src" 0640 "${W}/dest"
+    [ "$(cat "${W}/dest")" = "new" ]
+    if [[ "$(cat /proc/sys/fs/protected_symlinks 2>/dev/null)" == 1 \
+          && "$(cat /proc/sys/fs/protected_regular 2>/dev/null)" =~ ^[1-9] ]]; then
+        mkdir -m 1777 "${W}/sticky"
+        printf 'newer\n' > "${W}/sticky/src"
+        install_atomic "${W}/sticky/src" 0640 "${W}/dest"
+        [ "$(cat "${W}/dest")" = "newer" ]
+    fi
+    # A relative source is resolved before the check, not refused for its shape.
+    printf 'rel\n' > "${W}/private/rel"
+    (cd "${W}/private" && install_atomic rel 0640 "${W}/dest")
+    [ "$(cat "${W}/dest")" = "rel" ]
+    # A source that does not exist is named, and nothing is staged.
+    run --separate-stderr install_atomic "${W}/private/nosuch" 0640 "${W}/dest"
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"cannot be resolved"* ]]
+    no_leftovers
+}
+
 @test "install_atomic: a missing source, a directory at the target, a missing parent or an open parent returns 1 and keeps what is there" {
     printf 'old\n' > "${W}/dest"
     run install_atomic "${W}/nosuch" 0644 "${W}/dest"
