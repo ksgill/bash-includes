@@ -27,6 +27,8 @@ lib/teardown.sh       snapshot what a rebuild removes, stop units, remove it
 lib/os.sh             OS, arch, kernel, init and session detection
 lib/apt.sh            APT repository and package helpers
 lib/host.sh           hostname validation and setting
+lib/prompt.sh         a yes/no question with an explicit default, answered at the terminal or by the unattended run's flag; 2 when there is no terminal
+lib/command.sh        the commands a script needs: the path a bare-name call runs, or with --sbin the one sudo's secure_path resolves; every missing one named at once
 lib/net.sh            address, mask and range arithmetic
 lib/oui.sh            MAC vendor lookup
 lib/mac.sh            read an interface's MAC address; set it and read it back, in this or another network namespace
@@ -449,6 +451,86 @@ refused with a warning that names the component in the way, and nothing is
 created. An existing file at the path is reused only if it is a regular file
 owned by the invoking user; a link or anything else there is never written
 through.
+
+## Changes in v1.17.0
+
+Two modules lifted out of the consumers that each carried them (FA-fleet-025),
+and `bin/provision-report` put in the entry-point shape (FA-fleet-026).
+Nothing existing changes for a consumer that uses neither module.
+
+- **`prompt.sh`** (new, includes log.sh) — `confirm --default yes|no
+  [--assume yes|no|''] [--] <question>` asks on the terminal, the question
+  suffixed ` [Y/n] ` or ` [y/N] ` after the default, and returns 0 for yes
+  (`y` or `yes` in any case, or Enter when the default is yes), 1 for no
+  (`n` or `no`, or Enter when the default is no) and 2 for no answer: stdin
+  is not a terminal, in which case nothing is read from it, or it reached
+  end of file. `--default` is required and applies to an empty reply only,
+  never to end of file; anything else typed gets "Please answer yes or no."
+  and the question again. `--assume yes|no` answers without asking and
+  `log_info`s "<question> <answer> (assumed)", so a transcript shows what an
+  unattended run agreed to; `''` means ask, so a caller keeps its own flag
+  and passes the answer it implies (`confirm --assume "$ASSUME" …`). The
+  prompt goes to stderr, written by `printf`, not `read -p`, which shows
+  its prompt only when stdin is a terminal. Whatever was typed before the
+  prompt was printed is discarded first (on a terminal only: short
+  non-canonical reads until one times out), so a `y` typed ahead of the
+  question, with or without Enter, does not answer it. The question goes through
+  `log_printable` in the prompt and in the assumed line, so text read from
+  a device or a tool's output cannot reshape the line. A bad option, a bad
+  value or a missing question dies: that is a bug in the caller.
+  `_prompt_tty` is the terminal test and the seam a test replaces; the
+  drain does nothing when stdin is not a real terminal, so a test's
+  here-string is left for the read. Lifted from git-bootstrap,
+  rbp-img-bld, rover-bld and wifi-cap-test, whose four copies had diverged
+  in behaviour, not only in spelling: git-bootstrap defaults to yes and
+  lower-cases with `${reply,,}` (bash 4), the other three default to no;
+  rbp-img-bld dies on a no where the others return a status; wifi-cap-test
+  survives end of file where the others return the read failure; and the
+  unattended switch is `NON_INTERACTIVE == true`, `NON_INTERACTIVE -eq 1`
+  or `ASSUME_YES -eq 1`. What a "no" leads to stays with the caller:
+  `confirm … || die "Aborted"`.
+
+- **`command.sh`** (new, includes log.sh) — `command_path [--sbin] <name>`
+  prints the absolute path a bare-name call would run, or returns 1 with
+  nothing: `type -P`, an absolute PATH entry only (`.` and an empty
+  component do not count), a regular executable file (a function, alias or
+  builtin does not, so a test's stub cannot satisfy a preflight); a name
+  that is empty or holds a `/` is refused, since this looks names up and
+  does not test paths. `commands_present [--sbin] <name>...` prints the
+  missing names on one line, in the order given, and returns 1, logging
+  nothing (`if ! missing="$(commands_present a b)"; then …`). `require_commands
+  [--sbin] [--hint <text>] [--] <name>...` returns when every name is found
+  and otherwise `log_error`s "Missing required commands: <names>", then the
+  hint on a line of its own when given, and exits 1 — every missing command
+  at once, where cell-pi-setup's copy stopped at the first. `--sbin` is
+  the other lookup, for a command the script runs through `sudo`: the path
+  sudo's `secure_path` resolves, from `/usr/local/sbin /usr/local/bin
+  /usr/sbin /usr/bin /sbin /bin` in that order (`_COMMAND_SBIN_DIRS`,
+  assigned by the library, never inherited from the environment, so a
+  built script cannot be pointed elsewhere; a test sets it after sourcing;
+  a relative entry is ignored, and empty it finds nothing) and never from
+  the caller's PATH — a stub in `~/.local/bin` ahead of `/usr/sbin` is
+  what this shell would run, not what root runs, and a path printed from
+  PATH and then run under sudo would bypass `secure_path` (found by the
+  security review). It is opt-in on purpose: a normal user's PATH can omit
+  the sbin directories (Debian's non-root default does), so for a command
+  the script calls by bare name without sudo, `--sbin` would pass a check
+  that the call then fails. `--` ends the options in all three, so a name
+  may look like one.
+  Which commands a script needs, which package provides each and what to
+  tell the operator stay with the caller; whether a package is installed is
+  `apt_pkg_state`. Lifted from the three `require_tools` copies in
+  cell-pi-setup, rbp-encrypt and rbp-img-bld (and the same checks under
+  other names in open-wifi-scanner and wifi-cap-test).
+
+- **`bin/provision-report` has `set -euo pipefail` on line 2**, above its
+  header comment, as every other entry point in the fleet does
+  (FA-fleet-026). Only comments preceded it, so nothing behaves differently;
+  it is one of the files a migration copies its shape from. Not inlined
+  into any consumer, so no re-pin is needed for it.
+
+The six consumers drop their copies on their next re-pin, a dist/ rebuild and
+a CI run each.
 
 ## Changes in v1.16.3
 

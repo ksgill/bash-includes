@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # provision-report — read and verify the system change journal.
 #
 # Answers "what has been done to this machine, and has anything changed since?"
@@ -6,8 +7,6 @@
 #
 # Deliberately dependency-free: the journal is flat JSON with string values only,
 # so it is parsed here with bash regex rather than requiring jq or python.
-
-set -euo pipefail
 
 JOURNAL_FILE="${JOURNAL_FILE:-/var/lib/provision/changes.jsonl}"
 
