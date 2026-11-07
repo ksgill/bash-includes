@@ -185,7 +185,19 @@ jobs:
       - if: steps.check.outputs.have == 'yes'
         run: sudo apt-get update && sudo apt-get install -y bats
       - if: steps.check.outputs.have == 'yes'
+        # TMPDIR under the runner's own directory, not /tmp: the 26.04 runner
+        # images that ubuntu-latest is migrating to leave fs.protected_regular
+        # and fs.protected_symlinks off, and file_dir_trusted then refuses a
+        # world-writable /tmp as a staging or install parent — which is the
+        # rule doing its job, on a host less hardened than the targets. A
+        # user-owned 0700 directory passes on every image, so a suite that
+        # exercises install_file_if_changed / install_atomic / mkdir_root_p
+        # gives the same answer in CI as on a fleet host.
+        #
         # --print-output-on-failure (bats >= 1.5): a failed case shows the
         # script's stdout/stderr in the log, so a runner-only failure can be
         # diagnosed from CI alone.
-        run: bats --print-output-on-failure tests/
+        run: |
+          mkdir -m 0700 "${RUNNER_TEMP}/bats-tmp"
+          export TMPDIR="${RUNNER_TEMP}/bats-tmp"
+          bats --print-output-on-failure tests/
