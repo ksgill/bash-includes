@@ -198,6 +198,12 @@ jobs:
         # script's stdout/stderr in the log, so a runner-only failure can be
         # diagnosed from CI alone.
         run: |
-          mkdir -m 0700 "${RUNNER_TEMP}/bats-tmp"
+          # 0755, not 0700: the journal hashes only world-readable content and
+          # judges that along the directory chain, so the chain must be
+          # readable by others while writable by nobody but its owner. The
+          # runner's own directories get o+rx (never write) for the same reason.
+          mkdir -m 0755 "${RUNNER_TEMP}/bats-tmp"
+          chmod o+rx "${RUNNER_TEMP}" "${RUNNER_TEMP%/*}" "${HOME}" 2>/dev/null || true
           export TMPDIR="${RUNNER_TEMP}/bats-tmp"
+          d="${TMPDIR}"; while [ "$d" != / ]; do stat -c '%A %U:%G %n' "$d"; d="${d%/*}"; [ -n "$d" ] || d=/; done
           bats --print-output-on-failure tests/
